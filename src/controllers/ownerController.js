@@ -1434,14 +1434,16 @@ export const createOwnerJobAssignmentUser = async (req, res) => {
         `
         INSERT INTO drivers (
           user_id,
+          agency_id,
           vehicle_number,
           license_number,
           is_available,
           rating
-        ) VALUES (?, ?, ?, 1, 0.0)
+        ) VALUES (?, ?, ?, ?, 1, 0.0)
         `,
         [
           userId,
+          req.user.agency_id,
           vehicleNumber ? String(vehicleNumber).trim() : null,
           drivingLicenseNumber ? String(drivingLicenseNumber).trim() : null,
         ],

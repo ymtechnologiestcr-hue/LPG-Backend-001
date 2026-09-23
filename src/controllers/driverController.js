@@ -104,7 +104,7 @@ const resolveDriverId = async (value, queryRunner = db) => {
   try {
     const [userRows] = await queryRunner.execute(
       `
-      SELECT id, role
+      SELECT id, role, agency_id
       FROM users
       WHERE id = ?
         AND role IN ('DRIVER', 'DELIVERY_AGENT')
@@ -116,10 +116,10 @@ const resolveDriverId = async (value, queryRunner = db) => {
     if (userRows.length) {
       const [insertRes] = await queryRunner.execute(
         `
-        INSERT INTO drivers (user_id, is_available, rating, created_at)
-        VALUES (?, 1, 0.0, NOW())
+        INSERT INTO drivers (user_id, agency_id, is_available, rating, created_at)
+        VALUES (?, ?, 1, 0.0, NOW())
         `,
-        [userRows[0].id],
+        [userRows[0].id, userRows[0].agency_id || null],
       );
       if (insertRes.insertId) {
         return Number(insertRes.insertId);
@@ -344,11 +344,11 @@ export const getDriverDashboard = async (req, res) => {
 
       FROM drivers d
       JOIN users u ON d.user_id = u.id
-      LEFT JOIN sales s ON s.driver_id = d.id
+      LEFT JOIN sales s ON s.driver_id = d.id AND s.agency_id = ?
       LEFT JOIN sales_items si ON si.sale_id = s.id
-      WHERE d.agency_id = ?
+      WHERE u.agency_id = ? AND (d.agency_id = ? OR d.agency_id IS NULL)
       `,
-      [...dateValues, req.user.agency_id]
+      [...dateValues, req.user.agency_id, req.user.agency_id, req.user.agency_id]
     );
 
     // =========================
@@ -378,10 +378,10 @@ export const getDriverDashboard = async (req, res) => {
 
       FROM drivers d
       JOIN users u ON d.user_id = u.id
-      LEFT JOIN sales s ON s.driver_id = d.id
+      LEFT JOIN sales s ON s.driver_id = d.id AND s.agency_id = ?
       LEFT JOIN sales_items si ON si.sale_id = s.id
 
-      WHERE d.agency_id = ?
+      WHERE u.agency_id = ? AND (d.agency_id = ? OR d.agency_id IS NULL)
       ${searchFilter}
 
       GROUP BY d.id, u.name, u.phone, d.rating, u.status, d.is_available, d.vehicle_number
@@ -389,7 +389,7 @@ export const getDriverDashboard = async (req, res) => {
 
       LIMIT ? OFFSET ?
       `,
-      [...dateValues, req.user.agency_id, ...searchValues, Number(limit), Number(offset)],
+      [...dateValues, req.user.agency_id, req.user.agency_id, req.user.agency_id, ...searchValues, Number(limit), Number(offset)],
     );
 
     console.log({ drivers });
@@ -401,10 +401,10 @@ export const getDriverDashboard = async (req, res) => {
       SELECT COUNT(*) AS total
       FROM drivers d
       JOIN users u ON d.user_id = u.id
-      WHERE d.agency_id = ?
+      WHERE u.agency_id = ? AND (d.agency_id = ? OR d.agency_id IS NULL)
       ${searchFilter}
       `,
-      [req.user.agency_id, ...searchValues],
+      [req.user.agency_id, req.user.agency_id, ...searchValues],
     );
 
     return res.json({
@@ -449,17 +449,24 @@ export const createDriver = async (req, res) => {
       });
     }
 
+    const [userRows] = await db.query(
+      `SELECT agency_id FROM users WHERE id = ? LIMIT 1`,
+      [user_id]
+    );
+    const agencyId = req.user?.agency_id || userRows?.[0]?.agency_id || null;
+
     // =========================
     // INSERT DRIVER
     // =========================
     const [result] = await db.execute(
       `
       INSERT INTO drivers 
-      (user_id, vehicle_number, license_number, is_available, rating, created_at)
-      VALUES (?, ?, ?, ?, ?, NOW())
+      (user_id, agency_id, vehicle_number, license_number, is_available, rating, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, NOW())
       `,
       [
         user_id,
+        agencyId,
         vehicle_number || null,
         license_number || null,
         is_available,

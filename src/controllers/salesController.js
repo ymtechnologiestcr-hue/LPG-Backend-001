@@ -64,16 +64,16 @@ export const getSalesDashboard = async (req, res) => {
         SUM(CASE WHEN p.method IN ('CASH', 'UPI') AND p.type = 'DRIVER' AND (s.payment_method != 'ONLINE' OR s.payment_method IS NULL) AND p.status = 'SUCCESS' THEN p.amount ELSE 0 END) AS total
       FROM drivers d
       JOIN users u ON d.user_id = u.id
-      LEFT JOIN sales s ON s.driver_id = d.id AND s.status = 'DELIVERED'
+      LEFT JOIN sales s ON s.driver_id = d.id AND s.status = 'DELIVERED' AND s.agency_id = ?
       LEFT JOIN payments p ON p.sale_id = s.id
-      WHERE d.agency_id = ?
+      WHERE u.agency_id = ? AND (d.agency_id = ? OR d.agency_id IS NULL)
       ${dateFilter}
       ${searchFilter}
       GROUP BY d.id
       ORDER BY total DESC
       LIMIT ? OFFSET ?
       `,
-      [...agencyValues, ...dateFilterValues, ...searchFilterValues, Number(limit), Number(offset)]
+      [agencyId, agencyId, agencyId, ...dateFilterValues, ...searchFilterValues, Number(limit), Number(offset)]
     );
 
     // =========================
@@ -84,12 +84,12 @@ export const getSalesDashboard = async (req, res) => {
       SELECT COUNT(DISTINCT d.id) AS total
       FROM drivers d
       JOIN users u ON d.user_id = u.id
-      LEFT JOIN sales s ON s.driver_id = d.id AND s.status = 'DELIVERED'
-      WHERE d.agency_id = ?
+      LEFT JOIN sales s ON s.driver_id = d.id AND s.status = 'DELIVERED' AND s.agency_id = ?
+      WHERE u.agency_id = ? AND (d.agency_id = ? OR d.agency_id IS NULL)
       ${dateFilter}
       ${searchFilter}
       `,
-      [...agencyValues, ...dateFilterValues, ...searchFilterValues]
+      [agencyId, agencyId, agencyId, ...dateFilterValues, ...searchFilterValues]
     );
 
     // =========================

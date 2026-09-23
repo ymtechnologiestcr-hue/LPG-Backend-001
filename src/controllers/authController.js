@@ -114,8 +114,8 @@ const respondWithLogin = async (res, user) => {
         driverId = Number(dRows[0].id);
       } else {
         const [ins] = await db.execute(
-          "INSERT INTO drivers (user_id, is_available, rating, created_at) VALUES (?, 1, 0.0, NOW())",
-          [user.id]
+          "INSERT INTO drivers (user_id, agency_id, is_available, rating, created_at) VALUES (?, ?, 1, 0.0, NOW())",
+          [user.id, user.agency_id || null]
         );
         if (ins.insertId) {
           driverId = Number(ins.insertId);
