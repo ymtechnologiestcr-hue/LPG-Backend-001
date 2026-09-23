@@ -5,7 +5,7 @@ const DEFAULT_STOCK_AREA_ID = 1;
 // Adds `qty` to the running system_quantity tally for a product, on the
 // canonical stock row (default area preferred, otherwise the lowest-id row).
 // Creates a stock row if none exists. Floored at 0.
-const addSystemQuantity = async (connection, productId, qty) => {
+const addSystemQuantity = async (connection, productId, qty, agencyId = 1) => {
   const amount = Number(qty || 0);
 
   if (!Number(productId) || amount <= 0) {
@@ -16,12 +16,12 @@ const addSystemQuantity = async (connection, productId, qty) => {
     `
     SELECT id
     FROM stock
-    WHERE product_id = ?
+    WHERE product_id = ? AND agency_id = ?
     ORDER BY (stock_area_id = ?) DESC, id ASC
     LIMIT 1
     FOR UPDATE
     `,
-    [Number(productId), DEFAULT_STOCK_AREA_ID]
+    [Number(productId), agencyId, DEFAULT_STOCK_AREA_ID]
   );
 
   if (rows.length) {
@@ -37,10 +37,10 @@ const addSystemQuantity = async (connection, productId, qty) => {
   } else {
     await connection.query(
       `
-      INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity)
-      VALUES (?, ?, 0, GREATEST(?, 0))
+      INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, agency_id)
+      VALUES (?, ?, 0, GREATEST(?, 0), ?)
       `,
-      [Number(productId), DEFAULT_STOCK_AREA_ID, amount]
+      [Number(productId), DEFAULT_STOCK_AREA_ID, amount, agencyId]
     );
   }
 };
@@ -49,16 +49,20 @@ export const getIocOtpSummary = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = req.user?.agency_id || 1;
+
     const [rows] = await connection.query(`
       SELECT
-        COUNT(CASE WHEN DATE(dso.created_at) = CURDATE() THEN 1 END) AS today_received,
-        COUNT(CASE WHEN DATE(dso.created_at) = CURDATE() AND dso.status = 'PENDING' THEN 1 END) AS today_pending,
-        COUNT(CASE WHEN DATE(dso.created_at) = CURDATE() AND dso.status = 'SENT' THEN 1 END) AS today_sent,
+        COUNT(CASE WHEN DATE(CONVERT_TZ(dso.created_at, '+00:00', '+05:30')) = DATE(CONVERT_TZ(NOW(), '+00:00', '+05:30')) THEN 1 END) AS today_received,
+        COUNT(CASE WHEN DATE(CONVERT_TZ(dso.created_at, '+00:00', '+05:30')) = DATE(CONVERT_TZ(NOW(), '+00:00', '+05:30')) AND dso.status = 'PENDING' THEN 1 END) AS today_pending,
+        COUNT(CASE WHEN DATE(CONVERT_TZ(dso.created_at, '+00:00', '+05:30')) = DATE(CONVERT_TZ(NOW(), '+00:00', '+05:30')) AND dso.status = 'SENT' THEN 1 END) AS today_sent,
         COUNT(CASE WHEN dso.status = 'PENDING' THEN 1 END) AS all_pending
       FROM driver_sale_otps dso
       INNER JOIN sales s ON s.id = dso.sale_id
-      WHERE s.agency_id = ?
-    `, [req.user.agency_id]);
+      LEFT JOIN drivers d ON d.id = s.driver_id
+      LEFT JOIN users du ON du.id = d.user_id
+      WHERE (s.agency_id = ? OR dso.agency_id = ? OR du.agency_id = ?)
+    `, [agencyId, agencyId, agencyId]);
 
     const summary = rows[0] || {};
 
@@ -87,12 +91,13 @@ export const listIocOtps = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = req.user?.agency_id || 1;
     const status = String(req.query.status || "").trim().toUpperCase();
     const date = String(req.query.date || "").trim();
     const driverId = Number(req.query.driverId) || null;
 
-    const filters = ["s.agency_id = ?"];
-    const params = [req.user.agency_id];
+    const filters = ["(s.agency_id = ? OR dso.agency_id = ? OR du.agency_id = ?)"];
+    const params = [agencyId, agencyId, agencyId];
 
     if (status && status !== "ALL") {
       filters.push("dso.status = ?");
@@ -100,7 +105,7 @@ export const listIocOtps = async (req, res) => {
     }
 
     if (date) {
-      filters.push("DATE(dso.created_at) = ?");
+      filters.push("DATE(CONVERT_TZ(dso.created_at, '+00:00', '+05:30')) = ?");
       params.push(date);
     }
 
@@ -173,6 +178,7 @@ export const markIocOtpSent = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = req.user?.agency_id || 1;
     const otpId = Number(req.params.id);
 
     if (!otpId) {
@@ -189,9 +195,11 @@ export const markIocOtpSent = async (req, res) => {
     const [result] = await connection.query(
       `UPDATE driver_sale_otps dso 
        INNER JOIN sales s ON s.id = dso.sale_id 
-       SET dso.status = 'SENT' 
-       WHERE dso.id = ? AND dso.status = 'PENDING' AND s.agency_id = ?`,
-      [otpId, req.user.agency_id]
+       LEFT JOIN drivers d ON d.id = s.driver_id
+       LEFT JOIN users du ON du.id = d.user_id
+       SET dso.status = 'SENT', dso.agency_id = ?
+       WHERE dso.id = ? AND dso.status = 'PENDING' AND (s.agency_id = ? OR dso.agency_id = ? OR du.agency_id = ?)`,
+      [agencyId, otpId, agencyId, agencyId, agencyId]
     );
 
     if (!result.affectedRows) {
@@ -210,6 +218,12 @@ export const markIocOtpSent = async (req, res) => {
     const saleId = Number(otpRows[0]?.sale_id) || null;
 
     if (saleId) {
+      // Ensure sales row also has the correct agency_id if it was defaulted to 1
+      await connection.query(
+        "UPDATE sales SET agency_id = ? WHERE id = ? AND agency_id != ?",
+        [agencyId, saleId, agencyId]
+      );
+
       // A sale can have multiple products; accumulate system stock per product
       // by the quantity sold in this sale.
       const [items] = await connection.query(
@@ -223,7 +237,7 @@ export const markIocOtpSent = async (req, res) => {
       );
 
       for (const item of items) {
-        await addSystemQuantity(connection, item.product_id, item.quantity);
+        await addSystemQuantity(connection, item.product_id, item.quantity, agencyId);
       }
     }
 
@@ -250,6 +264,7 @@ export const addIocOtp = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = req.user?.agency_id || 1;
     const saleId = Number(req.body?.saleId);
     const otp = String(req.body?.otp || "").trim();
 
@@ -262,8 +277,11 @@ export const addIocOtp = async (req, res) => {
     }
 
     const [saleRows] = await connection.query(
-      "SELECT id FROM sales WHERE id = ? AND agency_id = ? LIMIT 1",
-      [saleId, req.user.agency_id]
+      `SELECT s.id FROM sales s
+       LEFT JOIN drivers d ON d.id = s.driver_id
+       LEFT JOIN users du ON du.id = d.user_id
+       WHERE s.id = ? AND (s.agency_id = ? OR du.agency_id = ?) LIMIT 1`,
+      [saleId, agencyId, agencyId]
     );
 
     if (!saleRows.length) {
@@ -271,8 +289,8 @@ export const addIocOtp = async (req, res) => {
     }
 
     const [result] = await connection.query(
-      "INSERT INTO driver_sale_otps (sale_id, otp, status) VALUES (?, ?, 'PENDING')",
-      [saleId, otp]
+      "INSERT INTO driver_sale_otps (sale_id, otp, status, agency_id) VALUES (?, ?, 'PENDING', ?)",
+      [saleId, otp, agencyId]
     );
 
     return res.status(201).json({
@@ -291,3 +309,4 @@ export const addIocOtp = async (req, res) => {
     connection.release();
   }
 };
+

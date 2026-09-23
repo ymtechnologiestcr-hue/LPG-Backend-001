@@ -1130,12 +1130,13 @@ export const createDriverSale = async (req, res) => {
       });
     }
 
-    // Fetch the driver's user_id so it can be used as created_by in stock_transactions
+    // Fetch the driver's user_id and agency_id so they can be used for attribution
     const [driverUserRows] = await connection.execute(
-      `SELECT user_id FROM drivers WHERE id = ? LIMIT 1`,
+      `SELECT d.user_id, u.agency_id FROM drivers d JOIN users u ON u.id = d.user_id WHERE d.id = ? LIMIT 1`,
       [numericDriverId],
     );
     const driverUserId = driverUserRows[0]?.user_id || null;
+    const agencyId = req.user?.agency_id || driverUserRows[0]?.agency_id || 1;
 
     if (!allocation_sales_item_id) {
       return res.status(400).json({
@@ -1376,15 +1377,16 @@ export const createDriverSale = async (req, res) => {
           `
           INSERT INTO users
           (
+            agency_id,
             name,
             phone,
             role,
             created_at,
             updated_at
           )
-          VALUES (?, ?, 'CUSTOMER', NOW(), NOW())
+          VALUES (?, ?, ?, 'CUSTOMER', NOW(), NOW())
           `,
-          [customer_name, phone || null],
+          [agencyId, customer_name, phone || null],
         );
 
         customerId = customerResult.insertId;
@@ -1432,6 +1434,7 @@ export const createDriverSale = async (req, res) => {
       `
       INSERT INTO sales
       (
+        agency_id,
         customer_id,
         driver_id,
         address_id,
@@ -1442,9 +1445,9 @@ export const createDriverSale = async (req, res) => {
         updated_at,
         delivered_at
       )
-      VALUES (?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW())
+      VALUES (?, ?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW())
       `,
-      [customerId, numericDriverId, addressId, finalAmount, payment_method],
+      [agencyId, customerId, numericDriverId, addressId, finalAmount, payment_method],
     );
 
     const saleId = saleResult.insertId;
@@ -1452,20 +1455,21 @@ export const createDriverSale = async (req, res) => {
     // Diagnostic: makes it visible in server logs whether the client actually
     // sent the OTP for this sale (the IOC OTP row is only created when it did).
     console.log(
-      `createDriverSale: saleId=${saleId} otpReceived=${normalizedOtp ? "yes" : "no"} otpLength=${normalizedOtp.length}`,
+      `createDriverSale: saleId=${saleId} agencyId=${agencyId} otpReceived=${normalizedOtp ? "yes" : "no"} otpLength=${normalizedOtp.length}`,
     );
 
     await connection.execute(
       `
       INSERT INTO driver_sale_otps
       (
+        agency_id,
         sale_id,
         otp,
         status
       )
-      VALUES (?, ?, 'PENDING')
+      VALUES (?, ?, ?, 'PENDING')
       `,
-      [saleId, normalizedOtp],
+      [agencyId, saleId, normalizedOtp],
     );
 
     const finalEmptyCylinderStatus =
@@ -1483,6 +1487,7 @@ export const createDriverSale = async (req, res) => {
       `
       INSERT INTO sales_items
       (
+        agency_id,
         sale_id,
         product_id,
         quantity,
@@ -1496,9 +1501,10 @@ export const createDriverSale = async (req, res) => {
         allocation_sale_id,
         allocation_sales_item_id
       )
-      VALUES (?, ?, ?, ?, 'DELIVERED', ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'DELIVERED', ?, ?, ?, ?, ?, ?, ?)
       `,
       [
+        agencyId,
         saleId,
         numericProductId,
         numericQuantity,
@@ -1534,15 +1540,16 @@ export const createDriverSale = async (req, res) => {
       `
       INSERT INTO payments
       (
+        agency_id,
         sale_id,
         amount,
         method,
         status,
         type
       )
-      VALUES (?, ?, ?, ?, 'DRIVER')
+      VALUES (?, ?, ?, ?, ?, 'DRIVER')
       `,
-      [saleId, finalAmount, paymentMethodForPayments, paymentStatus],
+      [agencyId, saleId, finalAmount, paymentMethodForPayments, paymentStatus],
     );
 
     const paymentId = paymentInsertResult.insertId;
@@ -1552,6 +1559,7 @@ export const createDriverSale = async (req, res) => {
         `
         INSERT INTO settlement_history
         (
+          agency_id,
           driver_id,
           sale_id,
           payment_id,
@@ -1560,9 +1568,9 @@ export const createDriverSale = async (req, res) => {
           status,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, 'ASSIGNED', NOW())
+        VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED', NOW())
         `,
-        [numericDriverId, saleId, paymentId, payment_method, finalAmount],
+        [agencyId, numericDriverId, saleId, paymentId, payment_method, finalAmount],
       );
     }
 
@@ -4710,10 +4718,17 @@ export const createDriverBooking = async (req, res) => {
       totalAmount += Number(product.price || 0) * Number(item.quantity || 0);
     });
 
+    const [driverUserRows] = await connection.execute(
+      `SELECT d.user_id, u.agency_id FROM drivers d JOIN users u ON u.id = d.user_id WHERE d.id = ? LIMIT 1`,
+      [numericDriverId],
+    );
+    const agencyId = req.user?.agency_id || driverUserRows[0]?.agency_id || 1;
+
     const [saleResult] = await connection.execute(
       `
       INSERT INTO sales
       (
+        agency_id,
         customer_id,
         driver_id,
         total_amount,
@@ -4724,9 +4739,9 @@ export const createDriverBooking = async (req, res) => {
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, NULL, 'PENDING', ?, 'BOOKING', NOW(), NOW())
+      VALUES (?, ?, ?, ?, NULL, 'PENDING', ?, 'BOOKING', NOW(), NOW())
       `,
-      [numericCustomerId, numericDriverId, totalAmount, numericAddressId],
+      [agencyId, numericCustomerId, numericDriverId, totalAmount, numericAddressId],
     );
 
     const saleId = saleResult.insertId;
@@ -4741,6 +4756,7 @@ export const createDriverBooking = async (req, res) => {
         `
         INSERT INTO sales_items
         (
+          agency_id,
           sale_id,
           product_id,
           quantity,
@@ -4751,15 +4767,16 @@ export const createDriverBooking = async (req, res) => {
           empty_cylinder_status,
           defective_qty
         )
-        VALUES (?, ?, ?, ?, 'PENDING', 0, ?, 'PENDING', 0)
+        VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, 'PENDING', 0)
         `,
-        [saleId, productId, quantity, price, quantity],
+        [agencyId, saleId, productId, quantity, price, quantity],
       );
 
       await connection.execute(
         `
         INSERT INTO stock_transactions
         (
+          agency_id,
           product_id,
           stock_area_id,
           type,
@@ -4773,9 +4790,10 @@ export const createDriverBooking = async (req, res) => {
           allocation_sale_id,
           allocation_sales_item_id
         )
-        VALUES (?, NULL, 'BOOKING_ADD', ?, 0, ?, ?, ?, 'godown', 0, ?, ?)
+        VALUES (?, ?, NULL, 'BOOKING_ADD', ?, 0, ?, ?, ?, 'godown', 0, ?, ?)
         `,
         [
+          agencyId,
           productId,
           quantity,
           saleId,

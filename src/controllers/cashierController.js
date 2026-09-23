@@ -5,9 +5,61 @@ const cashierDayLog = {
   closing: null,
 };
 
+let pettyCashColumnEnsured = false;
+let closingColumnsEnsured = false;
+let cashierOpeningsTableEnsured = false;
+let settlementSettledAtColumnEnsured = false;
+let expensePaymentColumnsEnsured = false;
+let officeExpensePaymentColumnsEnsured = false;
+let newConnectionCashierTablesEnsured = false;
+let splitPaymentsColumnsEnsured = false;
+let transferVoucherPaymentColumnsEnsured = false;
+let cashierReceiptsTableEnsured = false;
+
+const getTodayIST = () => {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return formatter.format(new Date());
+};
+
+let cachedSchemaColumnPresence = null;
+const getSchemaColumnPresence = async (executor = db) => {
+  if (cachedSchemaColumnPresence) return cachedSchemaColumnPresence;
+  try {
+    const [rows] = await executor.query(`
+      SELECT TABLE_NAME, COLUMN_NAME
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND (
+          (TABLE_NAME = 'expenses' AND COLUMN_NAME = 'payment_mode') OR
+          (TABLE_NAME = 'office_expenses' AND COLUMN_NAME IN ('status', 'payment_mode'))
+        )
+    `);
+    const set = new Set(rows.map((r) => `${r.TABLE_NAME}.${r.COLUMN_NAME}`));
+    cachedSchemaColumnPresence = {
+      hasExpensePaymentMode: set.has("expenses.payment_mode"),
+      hasOfficeExpenseStatus: set.has("office_expenses.status"),
+      hasOfficeExpensePaymentMode: set.has("office_expenses.payment_mode"),
+    };
+  } catch (err) {
+    console.warn("getSchemaColumnPresence error, defaulting to enabled:", err.message);
+    cachedSchemaColumnPresence = {
+      hasExpensePaymentMode: true,
+      hasOfficeExpenseStatus: true,
+      hasOfficeExpensePaymentMode: true,
+    };
+  }
+  return cachedSchemaColumnPresence;
+};
+
 // Petty cash the cashier keeps aside at Close Day. Stored on the closing row so
 // the next Start Day can read back how much was held over.
 const ensureCashierClosingPettyCashColumn = async (connection) => {
+  if (pettyCashColumnEnsured) return;
   const [cols] = await connection.query(
     `SELECT COLUMN_NAME FROM information_schema.COLUMNS
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'cashier_closings' AND COLUMN_NAME = 'petty_cash'`,
@@ -18,9 +70,11 @@ const ensureCashierClosingPettyCashColumn = async (connection) => {
       `ALTER TABLE cashier_closings ADD COLUMN petty_cash DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER total_cash`,
     );
   }
+  pettyCashColumnEnsured = true;
 };
 
 const ensureCashierClosingColumns = async (connection) => {
+  if (closingColumnsEnsured) return;
   await ensureCashierClosingPettyCashColumn(connection);
 
   const requiredColumns = {
@@ -55,6 +109,7 @@ const ensureCashierClosingColumns = async (connection) => {
       }
     }
   }
+  closingColumnsEnsured = true;
 };
 
 // Returns the retained in-office cash (petty cash) carried forward from the latest close.
@@ -96,8 +151,10 @@ const getLastClosingAt = async (connection, agency_id) => {
 // Checks whether the cashier day is currently OPEN:
 // A day is open if started_at is more recent than closed_at (or if it was started and never closed).
 const isCashierDayOpen = async (connection, agency_id) => {
-  const closeAt = await getLastClosingAt(connection, agency_id);
-  const openAt = await getLastOpeningAt(connection, agency_id);
+  const [closeAt, openAt] = await Promise.all([
+    getLastClosingAt(connection, agency_id),
+    getLastOpeningAt(connection, agency_id),
+  ]);
   if (!openAt) return false;
   if (!closeAt) return true;
   return new Date(openAt).getTime() >= new Date(closeAt).getTime();
@@ -106,6 +163,7 @@ const isCashierDayOpen = async (connection, agency_id) => {
 // Persists each "Start Day" so the running-day window can be anchored at the
 // moment the cashier opened the day (not just the previous close).
 const ensureCashierOpeningsTable = async (connection) => {
+  if (cashierOpeningsTableEnsured) return;
   await connection.query(`
     CREATE TABLE IF NOT EXISTS cashier_openings (
       id INT NOT NULL AUTO_INCREMENT,
@@ -117,6 +175,7 @@ const ensureCashierOpeningsTable = async (connection) => {
       KEY idx_cashier_openings_started_at (started_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+  cashierOpeningsTableEnsured = true;
 };
 
 // started_at of the most recent Start Day. Null if a day was never started.
@@ -148,11 +207,13 @@ const getCurrentDayAnchor = async (connection, agency_id) => {
 // and pick the opening balance back up only once the next day is started.
 const getCurrentDayOpeningBalance = async (connection, agency_id) => {
   await ensureCashierOpeningsTable(connection);
-  const closeAt = await getLastClosingAt(connection, agency_id);
-  const [openRows] = await connection.query(
-    `SELECT opening_amount, started_at FROM cashier_openings WHERE agency_id = ? ORDER BY id DESC LIMIT 1`,
-    [agency_id]
-  );
+  const [closeAt, [openRows]] = await Promise.all([
+    getLastClosingAt(connection, agency_id),
+    connection.query(
+      `SELECT opening_amount, started_at FROM cashier_openings WHERE agency_id = ? ORDER BY id DESC LIMIT 1`,
+      [agency_id]
+    ),
+  ]);
   if (!openRows.length) return 0;
   const openAt = openRows[0].started_at;
   const dayIsOpen =
@@ -163,6 +224,7 @@ const getCurrentDayOpeningBalance = async (connection, agency_id) => {
 // settlement_history.settled_at is stamped when the cashier verifies a driver's
 // collection, so cash-in can be dated by when it actually reached the drawer.
 const ensureSettlementSettledAtColumn = async (connection) => {
+  if (settlementSettledAtColumnEnsured) return;
   const [cols] = await connection.query(
     `SELECT COLUMN_NAME FROM information_schema.COLUMNS
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'settlement_history' AND COLUMN_NAME = 'settled_at'`,
@@ -172,6 +234,7 @@ const ensureSettlementSettledAtColumn = async (connection) => {
       `ALTER TABLE settlement_history ADD COLUMN settled_at DATETIME NULL AFTER status`,
     );
   }
+  settlementSettledAtColumnEnsured = true;
 };
 
 // Driver/purchase expense requests carry the payment mode chosen by the cashier
@@ -179,6 +242,7 @@ const ensureSettlementSettledAtColumn = async (connection) => {
 // counts CASH approvals as cash outflow, so the column must exist for non-cash
 // expenses to be excluded correctly.
 const ensureExpensePaymentColumns = async (connection) => {
+  if (expensePaymentColumnsEnsured) return;
   const requiredColumns = {
     payment_mode:
       "ALTER TABLE expenses ADD COLUMN payment_mode enum('CASH','UPI','CARD','BANK_TRANSFER') DEFAULT NULL AFTER status",
@@ -211,12 +275,14 @@ const ensureExpensePaymentColumns = async (connection) => {
       }
     }
   }
+  expensePaymentColumnsEnsured = true;
 };
 
 // Office expense entries carry the payment mode the cashier used to pay the
 // operational expense (CASH / UPI / CARD / BANK_TRANSFER) plus a reference id.
 // The cash ledger only counts CASH office expenses as cash outflow.
 const ensureOfficeExpensePaymentColumns = async (connection) => {
+  if (officeExpensePaymentColumnsEnsured) return;
   const requiredColumns = {
     payment_mode:
       "ALTER TABLE office_expenses ADD COLUMN payment_mode enum('CASH','UPI','CARD','BANK_TRANSFER') DEFAULT NULL AFTER description",
@@ -249,6 +315,7 @@ const ensureOfficeExpensePaymentColumns = async (connection) => {
       }
     }
   }
+  officeExpensePaymentColumnsEnsured = true;
 };
 
 // Safely resolve a valid user ID referencing users(id) to avoid foreign key violations
@@ -328,209 +395,196 @@ const makeSinceCloseDateCond = (anchorAt) => (dateExpr) => {
 //                  A transfer voucher is a CASH OUT (deposit refunded to the
 //                  customer), so it lowers the drawer when paid in cash.
 const getCashLedger = async (connection, makeDateCond, agency_id) => {
-  await ensureNewConnectionCashierTables(connection);
-  await ensureSplitPaymentsColumns(connection);
-  await ensureTransferVoucherPaymentColumns(connection);
-  await ensureSplitPaymentsColumns(connection);
-  await ensureSettlementSettledAtColumn(connection);
-  await ensureExpensePaymentColumns(connection);
-  await ensureOfficeExpensePaymentColumns(connection);
+  const executor = connection || db;
+  await ensureNewConnectionCashierTables(executor);
+  await ensureSplitPaymentsColumns(executor);
+  await ensureTransferVoucherPaymentColumns(executor);
+  await ensureSettlementSettledAtColumn(executor);
+  await ensureExpensePaymentColumns(executor);
+  await ensureOfficeExpensePaymentColumns(executor);
+  await ensureCashierReceiptsTable(executor);
 
   const num = (v) => Number(v || 0);
 
-  const [expModeCol] = await connection.query(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'expenses' AND COLUMN_NAME = 'payment_mode'`,
-  );
-  const expenseCashOnly = expModeCol.length
+  const schemaInfo = await getSchemaColumnPresence(executor);
+  const expenseCashOnly = schemaInfo.hasExpensePaymentMode
     ? "SUM(CASE WHEN e.payment_mode = 'CASH' OR e.payment_mode IS NULL THEN e.amount ELSE 0 END)"
     : "SUM(e.amount)";
-  const expenseUpiOnly = expModeCol.length
+  const expenseUpiOnly = schemaInfo.hasExpensePaymentMode
     ? "SUM(CASE WHEN e.payment_mode IN ('UPI', 'CARD') THEN e.amount ELSE 0 END)"
     : "0";
-  const expenseBankOnly = expModeCol.length
+  const expenseBankOnly = schemaInfo.hasExpensePaymentMode
     ? "SUM(CASE WHEN e.payment_mode = 'BANK_TRANSFER' THEN e.amount ELSE 0 END)"
     : "0";
 
-  const [oeStatusCol] = await connection.query(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'office_expenses' AND COLUMN_NAME = 'status'`,
-  );
-
-  const [oeModeCol] = await connection.query(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'office_expenses' AND COLUMN_NAME = 'payment_mode'`,
-  );
-  // Legacy office expenses (no payment_mode) are treated as CASH.
-  const officeCashOnly = oeModeCol.length
+  const officeCashOnly = schemaInfo.hasOfficeExpensePaymentMode
     ? "SUM(CASE WHEN oe.payment_mode = 'CASH' OR oe.payment_mode IS NULL THEN oe.amount ELSE 0 END)"
     : "SUM(oe.amount)";
-  const officeUpiOnly = oeModeCol.length
+  const officeUpiOnly = schemaInfo.hasOfficeExpensePaymentMode
     ? "SUM(CASE WHEN oe.payment_mode IN ('UPI', 'CARD') THEN oe.amount ELSE 0 END)"
     : "0";
-  const officeBankOnly = oeModeCol.length
+  const officeBankOnly = schemaInfo.hasOfficeExpensePaymentMode
     ? "SUM(CASE WHEN oe.payment_mode = 'BANK_TRANSFER' THEN oe.amount ELSE 0 END)"
     : "0";
+  const oeStatusFilter = schemaInfo.hasOfficeExpenseStatus ? "AND oe.status = 'APPROVED'" : "";
 
-  // ---- CASH IN ----
+  // Date predicates for each stream
   const drvC = makeDateCond("COALESCE(sh.settled_at, sh.created_at)");
-  const [drv] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE 
-         WHEN s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD') THEN 0
-         ELSE sh.amount 
-       END), 0) AS cash,
-       COALESCE(SUM(CASE 
-         WHEN s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD') THEN sh.amount 
-         ELSE 0 
-       END), 0) AS upi,
-       COUNT(*) AS cnt
-     FROM settlement_history sh
-     LEFT JOIN sales s ON s.id = sh.sale_id
-     WHERE sh.status = 'SETTLED' AND sh.agency_id = ? ${drvC.sql}`,
-    [agency_id, ...drvC.params],
-  );
-
   const offC = makeDateCond("p.created_at");
-  const [off] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN p.method = 'CASH' THEN p.amount ELSE 0 END), 0) AS cash,
-       COALESCE(SUM(CASE WHEN p.method IN ('UPI','CARD') THEN p.amount ELSE 0 END), 0) AS upi,
-       COALESCE(SUM(CASE WHEN p.method = 'BANK_TRANSFER' THEN p.amount ELSE 0 END), 0) AS bank,
-       COUNT(*) AS cnt
-     FROM payments p
-     INNER JOIN sales s ON s.id = p.sale_id
-     WHERE p.status = 'SUCCESS' AND s.sales_from = 'CASHIER' AND s.agency_id = ? ${offC.sql}`,
-    [agency_id, ...offC.params],
-  );
-
   const prC = makeDateCond("pr.paid_at");
-  const [pr] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN pr.payment_mode = 'CASH' THEN pr.penalty_amount ELSE 0 END), 0) AS cash,
-       COALESCE(SUM(CASE WHEN pr.payment_mode IN ('UPI','CARD') THEN pr.penalty_amount ELSE 0 END), 0) AS upi,
-       COALESCE(SUM(CASE WHEN pr.payment_mode = 'BANK_TRANSFER' THEN pr.penalty_amount ELSE 0 END), 0) AS bank,
-       COUNT(*) AS cnt
-     FROM customer_pr_penalties pr
-     WHERE pr.payment_status = 'PAID' AND pr.agency_id = ? ${prC.sql}`,
-    [agency_id, ...prC.params],
-  );
-
   const ncC = makeDateCond("nc.approved_at");
-  const [nc] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN nc.payment_mode = 'CASH' THEN nc.service_fee ELSE 0 END), 0) AS cash,
-       COALESCE(SUM(CASE WHEN nc.payment_mode IN ('UPI','CARD') THEN nc.service_fee ELSE 0 END), 0) AS upi,
-       COALESCE(SUM(CASE WHEN nc.payment_mode = 'BANK_TRANSFER' THEN nc.service_fee ELSE 0 END), 0) AS bank,
-       COUNT(*) AS cnt
-     FROM customer_name_change_requests nc
-     WHERE nc.status = 'APPROVED' AND nc.agency_id = ? ${ncC.sql}`,
-    [agency_id, ...ncC.params],
-  );
-
   const cnC = makeDateCond("cnc.paid_at");
-  const [cn] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN cnc.payment_mode = 'CASH' THEN cnc.total_amount ELSE 0 END), 0) AS cash,
-       COALESCE(SUM(CASE WHEN cnc.payment_mode IN ('UPI','CARD') THEN cnc.total_amount ELSE 0 END), 0) AS upi,
-       COALESCE(SUM(CASE WHEN cnc.payment_mode = 'BANK_TRANSFER' THEN cnc.total_amount ELSE 0 END), 0) AS bank,
-       COUNT(*) AS cnt
-     FROM customer_new_connections cnc
-     WHERE cnc.payment_status = 'PAID' AND cnc.agency_id = ? ${cnC.sql}`,
-    [agency_id, ...cnC.params],
-  );
-
-  await ensureCashierReceiptsTable(connection);
   const crC = makeDateCond("cr.created_at");
-  const [cr] = await connection.query(
-    `SELECT
-       COALESCE(SUM(CASE WHEN cr.payment_mode = 'CASH' THEN cr.amount ELSE 0 END), 0) AS cash,
-       COALESCE(SUM(CASE WHEN cr.payment_mode IN ('UPI','CARD') THEN cr.amount ELSE 0 END), 0) AS upi,
-       COALESCE(SUM(CASE WHEN cr.payment_mode = 'BANK_TRANSFER' THEN cr.amount ELSE 0 END), 0) AS bank,
-       COUNT(*) AS cnt
-     FROM cashier_receipts cr
-     WHERE cr.agency_id = ? ${crC.sql}`,
-    [agency_id, ...crC.params],
-  );
+  const expC = makeDateCond("e.created_at");
+  const oeC = makeDateCond("COALESCE(oe.created_at, oe.updated_at)");
+  const tvC = makeDateCond("t.updated_at");
+
+  // Execute all 9 independent aggregation streams concurrently via pool
+  const [
+    [drv],
+    [off],
+    [pr],
+    [nc],
+    [cn],
+    [cr],
+    [exp],
+    [oe],
+    [tv],
+  ] = await Promise.all([
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE 
+           WHEN s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD') THEN 0
+           ELSE sh.amount 
+         END), 0) AS cash,
+         COALESCE(SUM(CASE 
+           WHEN s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD') THEN sh.amount 
+           ELSE 0 
+         END), 0) AS upi,
+         COUNT(*) AS cnt
+       FROM settlement_history sh
+       LEFT JOIN sales s ON s.id = sh.sale_id
+       WHERE sh.status = 'SETTLED' AND sh.agency_id = ? ${drvC.sql}`,
+      [agency_id, ...drvC.params],
+    ),
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN p.method = 'CASH' THEN p.amount ELSE 0 END), 0) AS cash,
+         COALESCE(SUM(CASE WHEN p.method IN ('UPI','CARD') THEN p.amount ELSE 0 END), 0) AS upi,
+         COALESCE(SUM(CASE WHEN p.method = 'BANK_TRANSFER' THEN p.amount ELSE 0 END), 0) AS bank,
+         COUNT(*) AS cnt
+       FROM payments p
+       INNER JOIN sales s ON s.id = p.sale_id
+       WHERE p.status = 'SUCCESS' AND s.sales_from = 'CASHIER' AND s.agency_id = ? ${offC.sql}`,
+      [agency_id, ...offC.params],
+    ),
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN pr.payment_mode = 'CASH' THEN pr.penalty_amount ELSE 0 END), 0) AS cash,
+         COALESCE(SUM(CASE WHEN pr.payment_mode IN ('UPI','CARD') THEN pr.penalty_amount ELSE 0 END), 0) AS upi,
+         COALESCE(SUM(CASE WHEN pr.payment_mode = 'BANK_TRANSFER' THEN pr.penalty_amount ELSE 0 END), 0) AS bank,
+         COUNT(*) AS cnt
+       FROM customer_pr_penalties pr
+       WHERE pr.payment_status = 'PAID' AND pr.agency_id = ? ${prC.sql}`,
+      [agency_id, ...prC.params],
+    ),
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN nc.payment_mode = 'CASH' THEN nc.service_fee ELSE 0 END), 0) AS cash,
+         COALESCE(SUM(CASE WHEN nc.payment_mode IN ('UPI','CARD') THEN nc.service_fee ELSE 0 END), 0) AS upi,
+         COALESCE(SUM(CASE WHEN nc.payment_mode = 'BANK_TRANSFER' THEN nc.service_fee ELSE 0 END), 0) AS bank,
+         COUNT(*) AS cnt
+       FROM customer_name_change_requests nc
+       WHERE nc.status = 'APPROVED' AND nc.agency_id = ? ${ncC.sql}`,
+      [agency_id, ...ncC.params],
+    ),
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN cnc.payment_mode = 'CASH' THEN cnc.total_amount ELSE 0 END), 0) AS cash,
+         COALESCE(SUM(CASE WHEN cnc.payment_mode IN ('UPI','CARD') THEN cnc.total_amount ELSE 0 END), 0) AS upi,
+         COALESCE(SUM(CASE WHEN cnc.payment_mode = 'BANK_TRANSFER' THEN cnc.total_amount ELSE 0 END), 0) AS bank,
+         COUNT(*) AS cnt
+       FROM customer_new_connections cnc
+       WHERE cnc.payment_status = 'PAID' AND cnc.agency_id = ? ${cnC.sql}`,
+      [agency_id, ...cnC.params],
+    ),
+    db.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN cr.payment_mode = 'CASH' THEN cr.amount ELSE 0 END), 0) AS cash,
+         COALESCE(SUM(CASE WHEN cr.payment_mode IN ('UPI','CARD') THEN cr.amount ELSE 0 END), 0) AS upi,
+         COALESCE(SUM(CASE WHEN cr.payment_mode = 'BANK_TRANSFER' THEN cr.amount ELSE 0 END), 0) AS bank,
+         COUNT(*) AS cnt
+       FROM cashier_receipts cr
+       WHERE cr.agency_id = ? ${crC.sql}`,
+      [agency_id, ...crC.params],
+    ),
+    db.query(
+      `SELECT COALESCE(SUM(e.amount), 0) AS total,
+              COALESCE(${expenseCashOnly}, 0) AS cash,
+              COALESCE(${expenseUpiOnly}, 0) AS upi,
+              COALESCE(${expenseBankOnly}, 0) AS bank,
+              COUNT(*) AS cnt
+       FROM expenses e
+       WHERE e.status = 'APPROVED' AND e.agency_id = ? ${expC.sql}`,
+      [agency_id, ...expC.params],
+    ),
+    db.query(
+      `SELECT COALESCE(SUM(oe.amount), 0) AS total,
+              COALESCE(${officeCashOnly}, 0) AS cash,
+              COALESCE(${officeUpiOnly}, 0) AS upi,
+              COALESCE(${officeBankOnly}, 0) AS bank,
+              COUNT(*) AS cnt
+       FROM office_expenses oe
+       WHERE oe.agency_id = ? ${oeStatusFilter} ${oeC.sql}`,
+      [agency_id, ...oeC.params],
+    ),
+    db.query(
+      `SELECT COALESCE(SUM(t.deposit_liability), 0) AS total,
+              COALESCE(SUM(CASE WHEN t.payment_mode = 'CASH' THEN t.deposit_liability ELSE 0 END), 0) AS cash,
+              COALESCE(SUM(CASE WHEN t.payment_mode IN ('UPI','CARD') THEN t.deposit_liability ELSE 0 END), 0) AS upi,
+              COALESCE(SUM(CASE WHEN t.payment_mode = 'BANK_TRANSFER' THEN t.deposit_liability ELSE 0 END), 0) AS bank,
+              COUNT(*) AS cnt
+       FROM customer_connection_transfers t
+       WHERE t.status = 'APPROVED' AND t.agency_id = ? ${tvC.sql}`,
+      [agency_id, ...tvC.params],
+    ),
+  ]);
 
   const cashIn = {
     cash:
-      num(drv[0].cash) +
-      num(off[0].cash) +
-      num(pr[0].cash) +
-      num(nc[0].cash) +
-      num(cn[0].cash) +
-      num(cr[0].cash),
+      num(drv[0]?.cash) +
+      num(off[0]?.cash) +
+      num(pr[0]?.cash) +
+      num(nc[0]?.cash) +
+      num(cn[0]?.cash) +
+      num(cr[0]?.cash),
     online:
-      num(drv[0].upi) +
-      num(off[0].upi) +
-      num(pr[0].upi) +
-      num(nc[0].upi) +
-      num(cn[0].upi) +
-      num(cr[0].upi),
+      num(drv[0]?.upi) +
+      num(off[0]?.upi) +
+      num(pr[0]?.upi) +
+      num(nc[0]?.upi) +
+      num(cn[0]?.upi) +
+      num(cr[0]?.upi),
     bank:
-      num(off[0].bank) + num(pr[0].bank) + num(nc[0].bank) + num(cn[0].bank) + num(cr[0].bank),
+      num(off[0]?.bank) + num(pr[0]?.bank) + num(nc[0]?.bank) + num(cn[0]?.bank) + num(cr[0]?.bank),
     count:
-      num(drv[0].cnt) +
-      num(off[0].cnt) +
-      num(pr[0].cnt) +
-      num(nc[0].cnt) +
-      num(cn[0].cnt) +
-      num(cr[0].cnt),
+      num(drv[0]?.cnt) +
+      num(off[0]?.cnt) +
+      num(pr[0]?.cnt) +
+      num(nc[0]?.cnt) +
+      num(cn[0]?.cnt) +
+      num(cr[0]?.cnt),
   };
   cashIn.total = cashIn.cash + cashIn.online + cashIn.bank;
 
-  // ---- CASH OUT (approved only) ----
-  const expC = makeDateCond("e.created_at");
-  const [exp] = await connection.query(
-    `SELECT COALESCE(SUM(e.amount), 0) AS total,
-            COALESCE(${expenseCashOnly}, 0) AS cash,
-            COALESCE(${expenseUpiOnly}, 0) AS upi,
-            COALESCE(${expenseBankOnly}, 0) AS bank,
-            COUNT(*) AS cnt
-     FROM expenses e
-     WHERE e.status = 'APPROVED' AND e.agency_id = ? ${expC.sql}`,
-    [agency_id, ...expC.params],
-  );
-
-  let office = { total: 0, cash: 0, upi: 0, bank: 0, cnt: 0 };
-  const oeStatusFilter = oeStatusCol.length ? "AND oe.status = 'APPROVED'" : "";
-  const oeC = makeDateCond("COALESCE(oe.created_at, oe.updated_at)");
-  const [oe] = await connection.query(
-    `SELECT COALESCE(SUM(oe.amount), 0) AS total,
-            COALESCE(${officeCashOnly}, 0) AS cash,
-            COALESCE(${officeUpiOnly}, 0) AS upi,
-            COALESCE(${officeBankOnly}, 0) AS bank,
-            COUNT(*) AS cnt
-     FROM office_expenses oe
-     WHERE oe.agency_id = ? ${oeStatusFilter} ${oeC.sql}`,
-    [agency_id, ...oeC.params],
-  );
-  if (oe.length) {
-    office = oe[0];
-  }
-
-  // Transfer vouchers: an APPROVED voucher refunds the deposit to the customer,
-  // so a CASH-mode approval is a cash outflow. Dated by updated_at (stamped at
-  // approval). payment_mode column is guaranteed by ensureTransferVoucherPaymentColumns.
-  const tvC = makeDateCond("t.updated_at");
-  const [tv] = await connection.query(
-    `SELECT COALESCE(SUM(t.deposit_liability), 0) AS total,
-            COALESCE(SUM(CASE WHEN t.payment_mode = 'CASH' THEN t.deposit_liability ELSE 0 END), 0) AS cash,
-            COALESCE(SUM(CASE WHEN t.payment_mode IN ('UPI','CARD') THEN t.deposit_liability ELSE 0 END), 0) AS upi,
-            COALESCE(SUM(CASE WHEN t.payment_mode = 'BANK_TRANSFER' THEN t.deposit_liability ELSE 0 END), 0) AS bank,
-            COUNT(*) AS cnt
-     FROM customer_connection_transfers t
-     WHERE t.status = 'APPROVED' AND t.agency_id = ? ${tvC.sql}`,
-    [agency_id, ...tvC.params],
-  );
+  const office = oe[0] || { total: 0, cash: 0, upi: 0, bank: 0, cnt: 0 };
 
   const cashOut = {
-    cash: num(exp[0].cash) + num(office.cash) + num(tv[0].cash),
-    online: num(exp[0].upi) + num(office.upi) + num(tv[0].upi),
-    bank: num(exp[0].bank) + num(office.bank) + num(tv[0].bank),
-    total: num(exp[0].total) + num(office.total) + num(tv[0].total),
-    count: num(exp[0].cnt) + num(office.cnt) + num(tv[0].cnt),
+    cash: num(exp[0]?.cash) + num(office.cash) + num(tv[0]?.cash),
+    online: num(exp[0]?.upi) + num(office.upi) + num(tv[0]?.upi),
+    bank: num(exp[0]?.bank) + num(office.bank) + num(tv[0]?.bank),
+    total: num(exp[0]?.total) + num(office.total) + num(tv[0]?.total),
+    count: num(exp[0]?.cnt) + num(office.cnt) + num(tv[0]?.cnt),
   };
 
   return { cashIn, cashOut };
@@ -674,6 +728,7 @@ const validateCashierRequestPayment = (paymentMode, paymentId) => {
 };
 
 const ensureNewConnectionCashierTables = async (connection) => {
+  if (newConnectionCashierTablesEnsured) return;
   await connection.query(`
     CREATE TABLE IF NOT EXISTS customer_new_connection_products (
       id INT NOT NULL AUTO_INCREMENT,
@@ -733,13 +788,12 @@ const ensureNewConnectionCashierTables = async (connection) => {
       }
     }
   }
+  newConnectionCashierTablesEnsured = true;
 };
 
 export const getCashierDashboard = async (req, res) => {
-  const connection = await db.getConnection();
-
   try {
-    const lastClosing = await getLatestClosingBalance(connection, req.user.agency_id);
+    const agencyId = req.user.agency_id;
 
     // Optional date-range filter (YYYY-MM-DD). No range => all-time (default).
     const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
@@ -759,9 +813,6 @@ export const getCashierDashboard = async (req, res) => {
     const hasRange = Boolean(startDate && endDate);
     const rangeParams = hasRange ? [startDate, endDate] : [];
 
-    const receiptDateClause = hasRange
-      ? "AND DATE(COALESCE(s.delivered_at, s.created_at)) BETWEEN ? AND ?"
-      : "";
     const expenseWhereClause = hasRange
       ? "WHERE e.agency_id = ? AND DATE(e.created_at) BETWEEN ? AND ?"
       : "WHERE e.agency_id = ?";
@@ -773,95 +824,114 @@ export const getCashierDashboard = async (req, res) => {
       : "AND sh.agency_id = ?";
     const driverWhereClause = "WHERE u.agency_id = ?";
     
-    const queryParams = [req.user.agency_id, ...rangeParams];
+    const queryParams = [agencyId, ...rangeParams];
 
-    const [expenseRows] = await connection.query(
-      `
-      SELECT
-        COALESCE(SUM(e.amount), 0) AS totalExpenses,
-        COALESCE(SUM(CASE WHEN e.status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pendingApproval
-      FROM expenses e
-      ${expenseWhereClause}
-      `,
-      queryParams,
-    );
+    const todayIST = getTodayIST();
+    const requestIsTodayOnly = Boolean(hasRange && startDate === endDate && startDate === todayIST);
+    const useRunningDay = !hasRange || requestIsTodayOnly;
 
-    const [pendingExpenses] = await connection.query(
-      `
-      SELECT
-        e.id,
-        e.category,
-        e.description,
-        e.amount,
-        DATE_FORMAT(e.created_at, '%Y-%m-%d') AS date,
-        COALESCE(u.name, 'Unknown') AS createdBy,
-        e.status
-      FROM expenses e
-      LEFT JOIN users u ON u.id = e.created_by
-      WHERE e.status = 'PENDING'
-      ${pendingExpenseDateClause}
-      ORDER BY e.created_at DESC
-      LIMIT 2
-      `,
-      queryParams,
-    );
+    // Ensure required closing & opening schema if not already initialized
+    await ensureCashierClosingColumns(db);
+    await ensureCashierOpeningsTable(db);
 
-    const [driverRows] = await connection.query(
-      `
-      SELECT
-        d.id AS driver_id,
-        u.name AS driverName,
-        COALESCE(SUM(CASE WHEN (s.payment_method = 'CASH' OR (s.payment_method IS NULL AND sh.method = 'CASH')) AND sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS cashAssigned,
-        COALESCE(SUM(CASE WHEN (s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD')) AND sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS upiAssigned,
-        COALESCE(SUM(CASE WHEN sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS totalAssigned,
-        COALESCE(SUM(CASE WHEN (s.payment_method = 'CASH' OR (s.payment_method IS NULL AND sh.method = 'CASH')) AND sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS cashPending,
-        COALESCE(SUM(CASE WHEN (s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD')) AND sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS upiPending,
-        COALESCE(SUM(CASE WHEN sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS totalPending,
-        COALESCE(SUM(CASE WHEN sh.status = 'SETTLED' THEN sh.amount ELSE 0 END), 0) AS totalSettled,
-        CASE
-          WHEN COALESCE(SUM(CASE WHEN sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Pending'
-          WHEN COALESCE(SUM(CASE WHEN sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Assigned'
-          WHEN COALESCE(SUM(CASE WHEN sh.status = 'SETTLED' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Settled'
-          ELSE 'None'
-        END AS status
-      FROM drivers d
-      INNER JOIN users u ON u.id = d.user_id
-      LEFT JOIN settlement_history sh ON sh.driver_id = d.id AND sh.status IN ('ASSIGNED', 'PENDING', 'SETTLED') ${settlementDateClause}
-      LEFT JOIN sales s ON s.id = sh.sale_id
-      ${driverWhereClause}
-      GROUP BY d.id, u.name
-      ORDER BY totalPending DESC, u.name ASC
-      LIMIT 4
-      `,
-      [...queryParams, req.user.agency_id],
-    );
+    // Run primary dashboard queries + closing/opening metadata concurrently across pool
+    const [
+      [expenseRows],
+      [pendingExpenses],
+      [driverRows],
+      [closingRows],
+      [openingRows],
+    ] = await Promise.all([
+      db.query(
+        `
+        SELECT
+          COALESCE(SUM(e.amount), 0) AS totalExpenses,
+          COALESCE(SUM(CASE WHEN e.status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pendingApproval
+        FROM expenses e
+        ${expenseWhereClause}
+        `,
+        queryParams,
+      ),
+      db.query(
+        `
+        SELECT
+          e.id,
+          e.category,
+          e.description,
+          e.amount,
+          DATE_FORMAT(e.created_at, '%Y-%m-%d') AS date,
+          COALESCE(u.name, 'Unknown') AS createdBy,
+          e.status
+        FROM expenses e
+        LEFT JOIN users u ON u.id = e.created_by
+        WHERE e.status = 'PENDING'
+        ${pendingExpenseDateClause}
+        ORDER BY e.created_at DESC
+        LIMIT 2
+        `,
+        queryParams,
+      ),
+      db.query(
+        `
+        SELECT
+          d.id AS driver_id,
+          u.name AS driverName,
+          COALESCE(SUM(CASE WHEN (s.payment_method = 'CASH' OR (s.payment_method IS NULL AND sh.method = 'CASH')) AND sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS cashAssigned,
+          COALESCE(SUM(CASE WHEN (s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD')) AND sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS upiAssigned,
+          COALESCE(SUM(CASE WHEN sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS totalAssigned,
+          COALESCE(SUM(CASE WHEN (s.payment_method = 'CASH' OR (s.payment_method IS NULL AND sh.method = 'CASH')) AND sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS cashPending,
+          COALESCE(SUM(CASE WHEN (s.payment_method IN ('UPI', 'ONLINE') OR sh.method IN ('UPI', 'ONLINE', 'CARD')) AND sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS upiPending,
+          COALESCE(SUM(CASE WHEN sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) AS totalPending,
+          COALESCE(SUM(CASE WHEN sh.status = 'SETTLED' THEN sh.amount ELSE 0 END), 0) AS totalSettled,
+          CASE
+            WHEN COALESCE(SUM(CASE WHEN sh.status = 'PENDING' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Pending'
+            WHEN COALESCE(SUM(CASE WHEN sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Assigned'
+            WHEN COALESCE(SUM(CASE WHEN sh.status = 'SETTLED' THEN sh.amount ELSE 0 END), 0) > 0 THEN 'Settled'
+            ELSE 'None'
+          END AS status
+        FROM drivers d
+        INNER JOIN users u ON u.id = d.user_id
+        LEFT JOIN settlement_history sh ON sh.driver_id = d.id AND sh.status IN ('ASSIGNED', 'PENDING', 'SETTLED') ${settlementDateClause}
+        LEFT JOIN sales s ON s.id = sh.sale_id
+        ${driverWhereClause}
+        GROUP BY d.id, u.name
+        ORDER BY totalPending DESC, u.name ASC
+        LIMIT 4
+        `,
+        [...queryParams, agencyId],
+      ),
+      db.query(
+        `SELECT total_cash, petty_cash, created_at FROM cashier_closings WHERE agency_id = ? ORDER BY id DESC LIMIT 1`,
+        [agencyId],
+      ),
+      db.query(
+        `SELECT opening_amount, started_at FROM cashier_openings WHERE agency_id = ? ORDER BY id DESC LIMIT 1`,
+        [agencyId],
+      ),
+    ]);
 
     const expenseSummary = expenseRows[0] || {
       totalExpenses: 0,
       pendingApproval: 0,
     };
 
-    // Unified cash accounting. A historical date range is for viewing past days;
-    // but the DEFAULT / today-only view shows the CURRENT RUNNING DAY (since the
-    // last Close/Start), so cash in/out reset to 0 on Start Day and only the
-    // opening balance carries. Total Cash In = CASH only; Cash Out = APPROVED
-    // cash only; Current Balance = opening + cash in − cash out.
-    let requestIsTodayOnly = false;
-    if (hasRange && startDate === endDate) {
-      const [todayCheck] = await connection.query(
-        "SELECT (? = CURDATE()) AS isToday",
-        [startDate],
-      );
-      requestIsTodayOnly = Number(todayCheck[0]?.isToday) === 1;
-    }
-    const useRunningDay = !hasRange || requestIsTodayOnly;
-    const dayIsOpen = await isCashierDayOpen(connection, req.user.agency_id);
-    const latestClosing = await getLatestClosing(connection, req.user.agency_id);
+    const latestClosing = closingRows.length
+      ? {
+          totalCash: Number(closingRows[0].total_cash || 0),
+          pettyCash: Number(closingRows[0].petty_cash || 0),
+          closedAt: closingRows[0].created_at,
+        }
+      : null;
+
+    const closeAt = latestClosing?.closedAt || null;
+    const openAt = openingRows.length ? openingRows[0].started_at : null;
+    const dayIsOpen = Boolean(openAt && (!closeAt || new Date(openAt).getTime() >= new Date(closeAt).getTime()));
+    const dayOpening = dayIsOpen && openingRows.length ? Number(openingRows[0].opening_amount || 0) : 0;
 
     const ledgerCond = useRunningDay
-      ? makeSinceCloseDateCond(await getCurrentDayAnchor(connection, req.user.agency_id))
+      ? makeSinceCloseDateCond(closeAt)
       : makeRangeDateCond(startDate, endDate);
-    const ledger = await getCashLedger(connection, ledgerCond, req.user.agency_id);
+    const ledger = await getCashLedger(db, ledgerCond, agencyId);
 
     let openingBalance = 0;
     let totalCashIn = 0;
@@ -885,7 +955,6 @@ export const getCashierDashboard = async (req, res) => {
       bankOut = ledger.cashOut.bank;
     } else if (dayIsOpen) {
       // Running day is OPEN
-      const dayOpening = await getCurrentDayOpeningBalance(connection, req.user.agency_id);
       openingBalance = Number(dayOpening || 0);
       totalCashIn = ledger.cashIn.cash;
       totalCashOut = ledger.cashOut.cash;
@@ -1039,8 +1108,6 @@ export const getCashierDashboard = async (req, res) => {
       message: "Failed to fetch cashier dashboard",
       error: error.message,
     });
-  } finally {
-    connection.release();
   }
 };
 
@@ -1594,6 +1661,7 @@ export const collectCashierNameChangeRequest = async (req, res) => {
 };
 
 const ensureSplitPaymentsColumns = async (connection) => {
+  if (splitPaymentsColumnsEnsured) return;
   const tables = [
     "customer_pr_penalties",
     "customer_name_change_requests",
@@ -1631,9 +1699,11 @@ const ensureSplitPaymentsColumns = async (connection) => {
       console.error(`Error adding split_payments for ${table}:`, err.message);
     }
   }
+  splitPaymentsColumnsEnsured = true;
 };
 
 const ensureTransferVoucherPaymentColumns = async (connection) => {
+  if (transferVoucherPaymentColumnsEnsured) return;
   const requiredColumns = {
     payment_mode:
       "ALTER TABLE customer_connection_transfers ADD COLUMN payment_mode enum('CASH','UPI','CARD','BANK_TRANSFER') DEFAULT NULL AFTER reason",
@@ -1668,6 +1738,7 @@ const ensureTransferVoucherPaymentColumns = async (connection) => {
       }
     }
   }
+  transferVoucherPaymentColumnsEnsured = true;
 };
 
 export const getCashierTransferVoucherRequests = async (req, res) => {
@@ -3748,6 +3819,7 @@ const normalizeReceiptEnum = (value) =>
     .replace(/[\s-]+/g, "_");
 
 const ensureCashierReceiptsTable = async (connection) => {
+  if (cashierReceiptsTableEnsured) return;
   await connection.query(`
     CREATE TABLE IF NOT EXISTS cashier_receipts (
       id INT NOT NULL AUTO_INCREMENT,
@@ -3765,6 +3837,7 @@ const ensureCashierReceiptsTable = async (connection) => {
       KEY idx_cashier_receipts_cashier (cashier_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+  cashierReceiptsTableEnsured = true;
 };
 
 const mapReceiptRow = (row) => ({
@@ -4218,23 +4291,10 @@ export const getCashFlowEntriesByDate = async (req, res) => {
       req.user.agency_id
     );
 
-    const [expModeCol] = await connection.query(
-      `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'expenses' AND COLUMN_NAME = 'payment_mode'`,
-    );
-    const ePaymentMode = expModeCol.length ? "e.payment_mode" : "NULL";
-
-    const [oeModeCol] = await connection.query(
-      `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'office_expenses' AND COLUMN_NAME = 'payment_mode'`,
-    );
-    const oePaymentMode = oeModeCol.length ? "oe.payment_mode" : "NULL";
-
-    const [oeStatusCol] = await connection.query(
-      `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'office_expenses' AND COLUMN_NAME = 'status'`,
-    );
-    const oeStatusFilter = oeStatusCol.length ? "AND oe.status = 'APPROVED'" : "";
+    const schemaInfo = await getSchemaColumnPresence(connection);
+    const ePaymentMode = schemaInfo.hasExpensePaymentMode ? "e.payment_mode" : "NULL";
+    const oePaymentMode = schemaInfo.hasOfficeExpensePaymentMode ? "oe.payment_mode" : "NULL";
+    const oeStatusFilter = schemaInfo.hasOfficeExpenseStatus ? "AND oe.status = 'APPROVED'" : "";
 
     const query = `
       SELECT 
