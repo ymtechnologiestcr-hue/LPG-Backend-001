@@ -1137,18 +1137,26 @@ export const getCashierDriverCollections = async (req, res) => {
 
     let joinCondition =
       "sh.driver_id = d.id AND sh.status IN ('ASSIGNED', 'PENDING', 'SETTLED') AND sh.agency_id = ?";
-    const queryParams = [req.user.agency_id];
-    if (hasRange) {
-      joinCondition += " AND DATE(sh.created_at) BETWEEN ? AND ?";
-      queryParams.push(startDate, endDate); // for settlement_history JOIN
-    }
-    // The iocOnlineCount correlated subquery also needs date params when range is set.
-    // These must come AFTER the JOIN params but BEFORE limit/offset.
+    const queryParams = [];
+
+    // 1. iocOnlineCount correlated subquery params (appears first in SELECT)
     queryParams.push(req.user.agency_id);
     if (hasRange) {
       queryParams.push(startDate, endDate); // for iocOnlineCount subquery
     }
-    queryParams.push(req.user.agency_id); // for u.agency_id = ?
+
+    // 2. settlement_history JOIN params (appears second in FROM/JOIN)
+    queryParams.push(req.user.agency_id);
+    if (hasRange) {
+      joinCondition +=
+        " AND (DATE(sh.created_at) BETWEEN ? AND ? OR (DATE(sh.created_at) < ? AND sh.status IN ('ASSIGNED', 'PENDING')))";
+      queryParams.push(startDate, endDate, startDate); // for settlement_history JOIN
+    }
+
+    // 3. WHERE u.agency_id = ?
+    queryParams.push(req.user.agency_id);
+
+    // 4. LIMIT & OFFSET
     queryParams.push(limit, offset);
     const [rows] = await connection.query(
       `

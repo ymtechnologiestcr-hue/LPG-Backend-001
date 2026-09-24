@@ -624,16 +624,17 @@ export const getDriverDeliveriesApp = async (req, res) => {
     );
 
     // Dashboard collection should match driver collection flow:
-    // include ASSIGNED (not yet sent) + PENDING (sent, awaiting cashier approval).
+    // include ASSIGNED (not yet sent) + PENDING (sent, awaiting cashier approval)
+    // including carried forward unsettled collections up to the end of the date range.
     const [pendingCollectionRows] = await db.execute(
       `
       SELECT COALESCE(SUM(sh.amount), 0) AS pending_collection
       FROM settlement_history sh
       WHERE sh.driver_id = ?
         AND sh.status IN ('ASSIGNED', 'PENDING')
-        AND DATE(sh.created_at) BETWEEN ? AND ?
+        AND DATE(sh.created_at) <= ?
       `,
-      [numericDriverId, startDate, endDate],
+      [numericDriverId, endDate],
     );
 
     let statusFilterQuery = "";
@@ -2009,11 +2010,13 @@ export const getDriverCollectionSummary = async (req, res) => {
       INNER JOIN sales s ON s.id = sh.sale_id
       LEFT JOIN users u ON u.id = s.customer_id
       WHERE sh.driver_id = ?
-        AND sh.status IN ('ASSIGNED', 'PENDING', 'SETTLED')
-        AND DATE(sh.created_at) BETWEEN ? AND ?
+        AND (
+          DATE(sh.created_at) BETWEEN ? AND ?
+          OR (DATE(sh.created_at) < ? AND sh.status IN ('ASSIGNED', 'PENDING'))
+        )
       ORDER BY sh.created_at ASC
       `,
-      [driverId, startDate, endDate],
+      [driverId, startDate, endDate, startDate],
     );
 
     const buildGroup = (method, status) => {
@@ -2053,6 +2056,7 @@ export const getDriverCollectionSummary = async (req, res) => {
           createdAt: item.created_at,
           status: item.status,
           method: item.method,
+          isCarryForward: toIsoDateString(item.created_at) < startDate,
         })),
       };
     };
@@ -2094,6 +2098,14 @@ export const getDriverCollectionSummary = async (req, res) => {
 
     const totalDeliveries = Number(deliveredRows[0].delivered);
 
+    const carriedForward = rows
+      .filter(
+        (r) =>
+          toIsoDateString(r.created_at) < startDate &&
+          ["ASSIGNED", "PENDING"].includes(r.status),
+      )
+      .reduce((sum, r) => sum + Number(r.amount || 0), 0);
+
     return res.status(200).json({
       success: true,
       message: "Collection summary fetched successfully",
@@ -2104,6 +2116,7 @@ export const getDriverCollectionSummary = async (req, res) => {
           totalCollected: cashTotal + upiTotal,
           totalDeliveries,
           totalSettled,
+          carriedForward,
         },
         settlements: {
           cashAssigned,
@@ -2150,10 +2163,9 @@ export const settleDriverCollectionsByMethod = async (req, res) => {
 
     await connection.beginTransaction();
 
-    // Fetch ALL assigned records for today regardless of original payment method.
+    // Fetch ALL assigned records up to today regardless of original payment method.
     // The driver should be able to hand over cash collections via UPI and vice versa.
-    // DATE(created_at) = CURDATE() prevents stale ASSIGNED records from previous days
-    // from being accidentally settled.
+    // DATE(created_at) <= CURDATE() allows settling carried forward assigned collections from previous days.
     const [rows] = await connection.execute(
       `
       SELECT sh.id, sh.amount, sh.method AS original_method, s.payment_method AS sale_payment_method
@@ -2161,7 +2173,7 @@ export const settleDriverCollectionsByMethod = async (req, res) => {
       LEFT JOIN sales s ON s.id = sh.sale_id
       WHERE sh.driver_id = ?
         AND sh.status = 'ASSIGNED'
-        AND DATE(sh.created_at) = CURDATE()
+        AND DATE(sh.created_at) <= CURDATE()
       ORDER BY (CASE WHEN (s.payment_method = ? OR (s.payment_method IS NULL AND sh.method = ?)) THEN 0 ELSE 1 END), sh.created_at ASC
       FOR UPDATE
       `,
