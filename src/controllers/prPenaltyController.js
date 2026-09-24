@@ -1,72 +1,37 @@
 import db from "../config/db.js";
-
-const parseConsumerNumberToId = (consumerNumber = "") => {
-  const digits = String(consumerNumber).replace(/\D/g, "");
-  if (!digits) {
-    return null;
-  }
-  return Number.parseInt(digits, 10);
-};
-
-const lookupCustomer = async (connection, { consumerNumber, customerName, agencyId }) => {
-  const consumerId = parseConsumerNumberToId(consumerNumber);
-
-  if (consumerId) {
-    const [rows] = await connection.query(
-      `
-      SELECT
-        u.id,
-        u.name,
-        u.phone,
-        u.consumer_number AS consumer_number
-      FROM users u
-      WHERE u.id = ? AND u.role = 'CUSTOMER' AND u.agency_id = ?
-      LIMIT 1
-      `,
-      [consumerId, agencyId]
-    );
-
-    return rows[0] || null;
-  }
-
-  if (!String(customerName || "").trim()) {
-    return null;
-  }
-
-  const [rows] = await connection.query(
-    `
-    SELECT
-      u.id,
-      u.name,
-      u.phone,
-      u.consumer_number AS consumer_number
-    FROM users u
-    WHERE u.role = 'CUSTOMER' AND u.name LIKE ? AND u.agency_id = ?
-    ORDER BY u.created_at DESC, u.id DESC
-    LIMIT 1
-    `,
-    [`%${String(customerName).trim()}%`, agencyId]
-  );
-
-  return rows[0] || null;
-};
+import { findCustomerForLookup } from "../utils/customerLookup.js";
 
 export const lookupPenaltyCustomer = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
-    const consumerNumber = String(req.query.consumerNumber || "").trim();
-    const customerName = String(req.query.customerName || "").trim();
+    const consumerNumber = String(
+      req.query.consumerNumber ||
+      req.query.phone ||
+      req.query.phoneNumber ||
+      req.query.search ||
+      ""
+    ).trim();
+    const customerName = String(
+      req.query.customerName ||
+      req.query.existingName ||
+      req.query.name ||
+      ""
+    ).trim();
 
     if (!consumerNumber && !customerName) {
       return res.status(400).json({
         success: false,
-        message: "consumerNumber or customerName is required",
+        message: "consumerNumber, phone, or customerName is required",
       });
     }
 
-    const agencyId = req.user.agency_id;
-    const customer = await lookupCustomer(connection, { consumerNumber, customerName, agencyId });
+    const agencyId = req.user?.agency_id || null;
+    const customer = await findCustomerForLookup(connection, {
+      identifier: consumerNumber,
+      name: customerName,
+      agencyId,
+    });
 
     if (!customer) {
       return res.status(404).json({
@@ -79,9 +44,12 @@ export const lookupPenaltyCustomer = async (req, res) => {
       success: true,
       data: {
         id: Number(customer.id),
+        customerId: Number(customer.id),
         name: customer.name,
         phone: customer.phone,
         consumerNumber: customer.consumer_number,
+        consumer_number: customer.consumer_number,
+        address: customer.address || "",
       },
     });
   } catch (error) {

@@ -1,4 +1,5 @@
 import db from "../config/db.js";
+import { searchCustomersList } from "../utils/customerLookup.js";
 
 const ALLOWED_ISSUE_TYPES = [
   "LEAKAGE",
@@ -46,39 +47,21 @@ export const getComplaintCustomers = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
-    const search = (req.query.search || "").trim();
+    const search = String(
+      req.query.search ||
+      req.query.consumerNumber ||
+      req.query.phone ||
+      req.query.phoneNumber ||
+      ""
+    ).trim();
     const limit = Math.max(parseInt(req.query.limit, 10) || 4, 1);
+    const agencyId = req.user?.agency_id || null;
 
-    const agencyId = req.user.agency_id;
-    const params = ["CUSTOMER", agencyId];
-    let whereClause = "WHERE role = ? AND agency_id = ?";
-
-    if (search) {
-      whereClause += " AND (name LIKE ? OR phone LIKE ? OR email LIKE ?)";
-      const likeSearch = `%${search}%`;
-      params.push(likeSearch, likeSearch, likeSearch);
-    }
-
-    params.push(limit);
-
-    const [rows] = await connection.query(
-      `
-      SELECT
-        u.id,
-        u.name,
-        u.phone,
-        u.email,
-        u.company_name,
-        u.consumer_number AS consumer_number,
-        COALESCE(a.address, '') AS address
-      FROM users u
-      LEFT JOIN addresses a ON a.user_id = u.id AND a.is_default = 1
-      ${whereClause}
-      ORDER BY u.name ASC
-      LIMIT ?
-      `,
-      params
-    );
+    const rows = await searchCustomersList(connection, {
+      search,
+      agencyId,
+      limit,
+    });
 
     return res.status(200).json({
       success: true,

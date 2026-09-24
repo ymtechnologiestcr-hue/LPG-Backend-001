@@ -523,6 +523,7 @@ function Dashboard({ onSignOut }) {
           setTransferForm((previous) => ({
             ...previous,
             ...mapped,
+            existingName: previous.existingName || record?.name || "",
           }));
         }
       } catch (error) {
@@ -548,6 +549,7 @@ function Dashboard({ onSignOut }) {
           setNameChangeForm((previous) => ({
             ...previous,
             ...mapped,
+            existingName: previous.existingName || record?.name || "",
           }));
         }
       } catch (error) {
@@ -573,6 +575,7 @@ function Dashboard({ onSignOut }) {
           setPrPenaltyForm((previous) => ({
             ...previous,
             ...mapped,
+            customerName: previous.customerName || record?.name || "",
           }));
         }
       } catch (error) {
@@ -2094,8 +2097,8 @@ function Dashboard({ onSignOut }) {
 
               <div className="transfer-fields two-column">
                 <div>
-                  <label>Consumer Number *</label>
-                  <input name="consumerNumber" value={transferForm.consumerNumber} onChange={handleTransferInputChange} placeholder="LPG-00012" />
+                  <label>Consumer Number / Phone *</label>
+                  <input name="consumerNumber" value={transferForm.consumerNumber} onChange={handleTransferInputChange} placeholder="e.g. 7598058964 or Phone" />
                 </div>
                 <div>
                   <label>Existing Name</label>
@@ -2218,8 +2221,8 @@ function Dashboard({ onSignOut }) {
             <article className="name-change-form-card">
               <div className="name-change-fields two-column">
                 <div>
-                  <label>Consumer Number *</label>
-                  <input name="consumerNumber" value={nameChangeForm.consumerNumber} onChange={handleNameChangeInputChange} placeholder="LPG-00012" />
+                  <label>Consumer Number / Phone *</label>
+                  <input name="consumerNumber" value={nameChangeForm.consumerNumber} onChange={handleNameChangeInputChange} placeholder="e.g. 7598058964 or Phone" />
                 </div>
                 <div>
                   <label>Service Fee (₹)</label>
@@ -2300,12 +2303,12 @@ function Dashboard({ onSignOut }) {
             <article className="pr-penalty-form-card">
               <div className="pr-penalty-fields two-column">
                 <div>
-                  <label>Consumer Number *</label>
+                  <label>Consumer Number / Phone *</label>
                   <input
                     name="consumerNumber"
                     value={prPenaltyForm.consumerNumber}
                     onChange={handlePrPenaltyInputChange}
-                    placeholder="LPG-00004"
+                    placeholder="e.g. 751008428 or Phone"
                   />
                 </div>
                 <div>
