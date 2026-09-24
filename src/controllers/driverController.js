@@ -2237,8 +2237,8 @@ export const settleDriverCollectionsByMethod = async (req, res) => {
           [rowAmount - remainingToSettle, row.id],
         );
         await connection.execute(
-          `INSERT INTO settlement_history (driver_id, sale_id, payment_id, method, amount, status, created_at)
-           SELECT driver_id, sale_id, payment_id, ?, ?, 'PENDING', created_at
+          `INSERT INTO settlement_history (agency_id, driver_id, sale_id, payment_id, method, amount, status, created_at)
+           SELECT agency_id, driver_id, sale_id, payment_id, ?, ?, 'PENDING', created_at
            FROM settlement_history WHERE id = ?`,
           [newMethod, remainingToSettle, row.id],
         );
