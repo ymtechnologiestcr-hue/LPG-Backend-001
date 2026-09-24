@@ -16,6 +16,8 @@ import {
 	postOwnerStockEntry,
 	getOwnerStockPriceList,
 	postOwnerStockPriceUpdates,
+	putOwnerStockProduct,
+	deleteOwnerStockProductEndpoint,
 	approveOwnerOfficeExpense,
 	createOwnerJobAssignmentUser,
 	updateOwnerJobAssignmentUserStatus,
@@ -47,5 +49,7 @@ router.post("/stocks/items", postOwnerStockItem);
 router.post("/stocks/entries", postOwnerStockEntry);
 router.get("/stocks/prices", getOwnerStockPriceList);
 router.post("/stocks/prices/update", postOwnerStockPriceUpdates);
+router.put("/stocks/products/:productId", putOwnerStockProduct);
+router.delete("/stocks/products/:productId", deleteOwnerStockProductEndpoint);
 
 export default router;

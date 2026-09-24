@@ -13,6 +13,8 @@ import {
   searchOwnerStockItems,
   updateOwnerStockPrices,
   upsertOwnerStockEntry,
+  updateOwnerStockProduct,
+  deleteOwnerStockProduct,
 } from "./stockController.js";
 
 const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -896,6 +898,14 @@ export const getOwnerStockPriceList = async (req, res) => {
 
 export const postOwnerStockPriceUpdates = async (req, res) => {
   return updateOwnerStockPrices(req, res);
+};
+
+export const putOwnerStockProduct = async (req, res) => {
+  return updateOwnerStockProduct(req, res);
+};
+
+export const deleteOwnerStockProductEndpoint = async (req, res) => {
+  return deleteOwnerStockProduct(req, res);
 };
 
 export const getOwnerExpensesDashboard = async (req, res) => {

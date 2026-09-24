@@ -129,6 +129,11 @@ export const getStockDashboard = async (req, res) => {
       `
       SELECT
         p.id AS product_id,
+        p.name AS product_name,
+        p.type AS product_type,
+        p.price AS product_price,
+        c.id AS category_id,
+        c.name AS category_name,
         CONCAT(p.name, ' - ', CASE WHEN p.type = 'DOMESTIC' THEN 'Domestic' ELSE 'Commercial' END) AS category,
 
         COALESCE(stk.opening, 0) AS opening,
@@ -137,7 +142,10 @@ export const getStockDashboard = async (req, res) => {
         COALESCE(pur.purchase, 0) AS purchase,
         COALESCE(pr.purchaseReturn, 0) AS purchaseReturn,
         COALESCE(def.defective, 0) AS defective,
-        COALESCE(stk.emptyQty, 0) AS emptyCylinders,
+        (
+          COALESCE(stk.emptyQty, 0) +
+          GREATEST(COALESCE(empties.collected, 0) - COALESCE(ret.returned, 0), 0)
+        ) AS emptyCylinders,
         GREATEST(COALESCE(stk.systemQty, 0), 0) AS systemStock
 
       FROM products p
@@ -196,8 +204,8 @@ export const getStockDashboard = async (req, res) => {
       LEFT JOIN (
         SELECT
           si.product_id,
-          SUM(CASE WHEN s.status = 'DELIVERED' THEN si.quantity ELSE 0 END) AS sales,
-          SUM(CASE WHEN s.status = 'CANCELLED' THEN si.quantity ELSE 0 END) AS salesReturn
+          SUM(CASE WHEN s.status = 'DELIVERED' THEN COALESCE(NULLIF(si.delivered_qty, 0), si.quantity, 0) ELSE 0 END) AS sales,
+          SUM(CASE WHEN s.status = 'CANCELLED' THEN COALESCE(NULLIF(si.delivered_qty, 0), si.quantity, 0) ELSE 0 END) AS salesReturn
         FROM sales_items si
         INNER JOIN sales s ON s.id = si.sale_id
         INNER JOIN products p ON p.id = si.product_id
@@ -206,6 +214,31 @@ export const getStockDashboard = async (req, res) => {
         ${salesAreaFilter}
         GROUP BY si.product_id
       ) sa ON sa.product_id = p.id
+
+      LEFT JOIN (
+        SELECT
+          si.product_id,
+          COALESCE(SUM(si.empty_cylinder_qty), 0) AS collected
+        FROM sales_items si
+        INNER JOIN sales s ON s.id = si.sale_id
+        WHERE s.agency_id = ?
+          AND s.status = 'DELIVERED'
+          ${salesDateFilter}
+        GROUP BY si.product_id
+      ) empties ON empties.product_id = p.id
+
+      LEFT JOIN (
+        SELECT
+          st.product_id,
+          COALESCE(SUM(st.quantity), 0) AS returned
+        FROM stock_transactions st
+        WHERE st.agency_id = ?
+          AND st.type = 'EMPTY_RETURN'
+          AND st.stock_from = 'driver'
+          AND COALESCE(st.isApproved, 0) = 1
+          ${txDateFilter}
+        GROUP BY st.product_id
+      ) ret ON ret.product_id = p.id
 
       WHERE 1=1
       ${productSearchFilter}
@@ -224,6 +257,10 @@ export const getStockDashboard = async (req, res) => {
         ...txAreaParams,
         ...salesDateParams,
         ...salesAreaParams,
+        req.user.agency_id,
+        ...salesDateParams,
+        req.user.agency_id,
+        ...txDateParams,
         ...productSearchParams,
         ...stockAreaProductParams,
         limit,
@@ -366,6 +403,11 @@ export const getStockDashboard = async (req, res) => {
 
         return {
           product_id: row.product_id,
+          product_name: row.product_name || "",
+          product_type: row.product_type || "DOMESTIC",
+          product_price: row.product_price == null ? null : Number(row.product_price),
+          category_id: row.category_id || null,
+          category_name: row.category_name || "",
           category: row.category,
           opening,
           sales,
@@ -572,7 +614,7 @@ export const getOwnerStockItemContext = async (req, res) => {
     if (stockAreaId) {
       [[stockRow]] = await connection.query(
         `
-        SELECT quantity
+        SELECT quantity, system_quantity
         FROM stock
         WHERE product_id = ? AND stock_area_id = ? AND agency_id = ?
         LIMIT 1
@@ -585,6 +627,7 @@ export const getOwnerStockItemContext = async (req, res) => {
       success: true,
       data: {
         quantity: stockRow ? Number(stockRow.quantity || 0) : null,
+        systemQuantity: stockRow ? Number(stockRow.system_quantity || 0) : null,
         price: product.price != null ? Number(product.price) : null,
         hasExistingData: Boolean(stockRow || product.price != null),
       },
@@ -766,6 +809,12 @@ export const upsertOwnerStockEntry = async (req, res) => {
   try {
     const itemId = Number(req.body.itemId || 0);
     const quantity = Number(req.body.quantity);
+    const rawSystemQty = req.body.systemQuantity !== undefined && req.body.systemQuantity !== null && req.body.systemQuantity !== ""
+      ? req.body.systemQuantity
+      : req.body.systemStock;
+    const systemQuantity = rawSystemQty !== undefined && rawSystemQty !== null && rawSystemQty !== ""
+      ? Number(rawSystemQty)
+      : 0;
     const price = Number(req.body.price);
     const note = String(req.body.note || "").trim();
 
@@ -779,7 +828,14 @@ export const upsertOwnerStockEntry = async (req, res) => {
     if (!Number.isFinite(quantity) || quantity < 0) {
       return res.status(400).json({
         success: false,
-        message: "quantity must be a non-negative number",
+        message: "Physical quantity must be a non-negative number",
+      });
+    }
+
+    if (!Number.isFinite(systemQuantity) || systemQuantity < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "System stock must be a non-negative number",
       });
     }
 
@@ -825,11 +881,14 @@ export const upsertOwnerStockEntry = async (req, res) => {
 
     await connection.query(
       `
-      INSERT INTO stock (product_id, stock_area_id, quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
-      VALUES (?, ?, ?, 0, 0, 0, ?)
-      ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), updated_at = CURRENT_TIMESTAMP
+      INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
+      VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+      ON DUPLICATE KEY UPDATE
+        quantity = VALUES(quantity),
+        system_quantity = VALUES(system_quantity),
+        updated_at = CURRENT_TIMESTAMP
       `,
-      [itemId, stockAreaId, Math.floor(quantity), req.user.agency_id]
+      [itemId, stockAreaId, Math.floor(quantity), Math.floor(systemQuantity), req.user.agency_id]
     );
 
     await connection.query(
@@ -1038,6 +1097,246 @@ export const updateOwnerStockPrices = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to update prices",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+export const updateOwnerStockProduct = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const productId = Number(req.params.productId || req.params.id || 0);
+    const { name, type, price, categoryName, openingStock, systemStock } = req.body;
+
+    if (!productId) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid productId is required",
+      });
+    }
+
+    const [[existingProduct]] = await connection.query(
+      `SELECT p.*, c.name AS current_category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ? LIMIT 1`,
+      [productId]
+    );
+
+    if (!existingProduct) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    await connection.beginTransaction();
+
+    let categoryId = existingProduct.category_id;
+    if (categoryName && String(categoryName).trim()) {
+      const cleanCatName = String(categoryName).trim();
+      const [[foundCat]] = await connection.query(
+        `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1`,
+        [cleanCatName]
+      );
+      if (foundCat) {
+        categoryId = foundCat.id;
+      } else {
+        const [catResult] = await connection.query(
+          `INSERT INTO categories (name) VALUES (?)`,
+          [cleanCatName]
+        );
+        categoryId = catResult.insertId;
+      }
+    }
+
+    const updatedName = name !== undefined && String(name).trim() ? String(name).trim() : existingProduct.name;
+    const updatedType = type && ["DOMESTIC", "COMMERCIAL"].includes(String(type).toUpperCase())
+      ? String(type).toUpperCase()
+      : existingProduct.type;
+    const updatedPrice = price !== undefined && price !== null && price !== "" ? Number(price) : existingProduct.price;
+
+    await connection.query(
+      `UPDATE products SET name = ?, type = ?, price = ?, category_id = ? WHERE id = ?`,
+      [updatedName, updatedType, updatedPrice, categoryId, productId]
+    );
+
+    if (openingStock !== undefined || systemStock !== undefined) {
+      const [[stockArea]] = await connection.query(
+        `SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1`,
+        [req.user.agency_id]
+      );
+      const stockAreaId = stockArea?.id || 1;
+
+      const newOpening = openingStock !== undefined && openingStock !== null && openingStock !== ""
+        ? Number(openingStock)
+        : null;
+      const newSystem = systemStock !== undefined && systemStock !== null && systemStock !== ""
+        ? Number(systemStock)
+        : null;
+
+      if (newOpening !== null && newSystem !== null) {
+        await connection.query(
+          `
+          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
+          VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+          ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), system_quantity = VALUES(system_quantity), updated_at = CURRENT_TIMESTAMP
+          `,
+          [productId, stockAreaId, Math.floor(newOpening), Math.floor(newSystem), req.user.agency_id]
+        );
+      } else if (newOpening !== null) {
+        await connection.query(
+          `
+          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
+          VALUES (?, ?, ?, 0, 0, 0, 0, ?)
+          ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), updated_at = CURRENT_TIMESTAMP
+          `,
+          [productId, stockAreaId, Math.floor(newOpening), req.user.agency_id]
+        );
+      } else if (newSystem !== null) {
+        await connection.query(
+          `
+          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
+          VALUES (?, ?, 0, ?, 0, 0, 0, ?)
+          ON DUPLICATE KEY UPDATE system_quantity = VALUES(system_quantity), updated_at = CURRENT_TIMESTAMP
+          `,
+          [productId, stockAreaId, Math.floor(newSystem), req.user.agency_id]
+        );
+      }
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: "Category and product updated successfully",
+      data: {
+        id: productId,
+        name: updatedName,
+        type: updatedType,
+        price: updatedPrice,
+        categoryId,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("updateOwnerStockProduct error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update category/product",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+export const deleteOwnerStockProduct = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const productId = Number(req.params.productId || req.params.id || 0);
+
+    if (!productId) {
+      return res.status(400).json({
+        success: false,
+        message: "Valid productId is required",
+      });
+    }
+
+    const [[existingProduct]] = await connection.query(
+      `SELECT id, name, category_id FROM products WHERE id = ? LIMIT 1`,
+      [productId]
+    );
+
+    if (!existingProduct) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    // Check if sales exist for this product
+    const [[salesCount]] = await connection.query(
+      `SELECT COUNT(*) AS count FROM sales_items WHERE product_id = ?`,
+      [productId]
+    );
+
+    if (salesCount && salesCount.count > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete "${existingProduct.name}" because it has ${salesCount.count} existing sales record(s).`,
+      });
+    }
+
+    // Check if purchase records exist for this product
+    const [[purchaseCount]] = await connection.query(
+      `SELECT COUNT(*) AS count FROM purchase_load_items WHERE product_id = ?`,
+      [productId]
+    );
+
+    if (purchaseCount && purchaseCount.count > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete "${existingProduct.name}" because it has ${purchaseCount.count} existing purchase record(s).`,
+      });
+    }
+
+    // Check if customer new connection records exist for this product
+    const [[connCount]] = await connection.query(
+      `SELECT COUNT(*) AS count FROM customer_new_connection_products WHERE product_id = ?`,
+      [productId]
+    );
+
+    if (connCount && connCount.count > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete "${existingProduct.name}" because it is linked to ${connCount.count} new connection record(s).`,
+      });
+    }
+
+    await connection.beginTransaction();
+
+    await connection.query(
+      `DELETE FROM stock_price_history WHERE product_id = ?`,
+      [productId]
+    );
+
+    await connection.query(
+      `DELETE FROM stock WHERE product_id = ? AND agency_id = ?`,
+      [productId, req.user.agency_id]
+    );
+
+    await connection.query(
+      `DELETE FROM stock_transactions WHERE product_id = ? AND agency_id = ?`,
+      [productId, req.user.agency_id]
+    );
+
+    await connection.query(`DELETE FROM products WHERE id = ?`, [productId]);
+
+    // Clean up category if empty
+    if (existingProduct.category_id) {
+      const [[catCount]] = await connection.query(
+        `SELECT COUNT(*) AS count FROM products WHERE category_id = ?`,
+        [existingProduct.category_id]
+      );
+      if (catCount && catCount.count === 0) {
+        await connection.query(`DELETE FROM categories WHERE id = ?`, [existingProduct.category_id]);
+      }
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: `Category/item "${existingProduct.name}" deleted successfully`,
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("deleteOwnerStockProduct error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.sqlMessage || error.message || "Failed to delete category/product",
       error: error.message,
     });
   } finally {
