@@ -1,4 +1,5 @@
 import db from "../config/db.js";
+import { ensureDailyStockSnapshot } from "../utils/stockLedger.js";
 
 export const getStockDashboard = async (req, res) => {
   const connection = await db.getConnection();
@@ -17,21 +18,22 @@ export const getStockDashboard = async (req, res) => {
     const safeStartDate = dateRegex.test(rawStartDate) ? rawStartDate : null;
     const safeEndDate = dateRegex.test(rawEndDate) ? rawEndDate : null;
 
-    let startDate = safeStartDate;
-    let endDate = safeEndDate;
+    const [[todayRow]] = await connection.query(`SELECT CAST(CURDATE() AS CHAR) AS today`);
+    const today = todayRow?.today;
 
-    if (startDate && !endDate) {
-      endDate = startDate;
-    }
+    let startDate = safeStartDate || today;
+    let endDate = safeEndDate || startDate;
 
-    if (!startDate && endDate) {
-      startDate = endDate;
-    }
-
-    if (startDate && endDate && startDate > endDate) {
+    if (startDate > endDate) {
       const swap = startDate;
       startDate = endDate;
       endDate = swap;
+    }
+
+    // Ensure snapshot baseline exists for the selected date(s)
+    await ensureDailyStockSnapshot(connection, req.user.agency_id, startDate, stockAreaId);
+    if (startDate !== today && endDate >= today) {
+      await ensureDailyStockSnapshot(connection, req.user.agency_id, today, stockAreaId);
     }
 
     const productSearchFilter = search
@@ -51,6 +53,11 @@ export const getStockDashboard = async (req, res) => {
       `
       : "";
     const stockAreaProductParams = stockAreaId ? [req.user.agency_id, stockAreaId] : [];
+
+    const snapshotAreaFilter = stockAreaId
+      ? `AND dss.agency_id = ? AND dss.stock_area_id = ?`
+      : `AND dss.agency_id = ?`;
+    const snapshotAreaParams = stockAreaId ? [req.user.agency_id, stockAreaId] : [req.user.agency_id];
 
     const stockSubAreaFilter = stockAreaId ? `WHERE s.agency_id = ? AND s.stock_area_id = ?` : `WHERE s.agency_id = ?`;
     const stockSubAreaParams = stockAreaId ? [req.user.agency_id, stockAreaId] : [req.user.agency_id];
@@ -97,17 +104,18 @@ export const getStockDashboard = async (req, res) => {
       LEFT JOIN categories c ON c.id = p.category_id
       LEFT JOIN (
         SELECT
-          s.product_id,
-          COALESCE(SUM(COALESCE(s.quantity, 0)), 0) AS opening
-        FROM stock s
-        ${stockSubAreaFilter}
-        GROUP BY s.product_id
+          dss.product_id,
+          COALESCE(SUM(dss.opening_stock), 0) AS opening
+        FROM daily_stock_snapshots dss
+        WHERE dss.snapshot_date = ?
+          ${snapshotAreaFilter}
+        GROUP BY dss.product_id
       ) stk ON stk.product_id = p.id
       WHERE 1=1
       ${productSearchFilter}
       ${stockAreaProductFilter}
       `,
-      [...stockSubAreaParams, ...productSearchParams, ...stockAreaProductParams]
+      [startDate, ...snapshotAreaParams, ...productSearchParams, ...stockAreaProductParams]
     );
 
     const [countRows] = await connection.query(
@@ -137,30 +145,51 @@ export const getStockDashboard = async (req, res) => {
         CONCAT(p.name, ' - ', CASE WHEN p.type = 'DOMESTIC' THEN 'Domestic' ELSE 'Commercial' END) AS category,
 
         COALESCE(stk.opening, 0) AS opening,
+        COALESCE(stk.system_opening, 0) AS system_opening,
+        COALESCE(stk.saved_closing_stock, 0) AS saved_closing_stock,
+        COALESCE(stk.saved_system_closing, 0) AS saved_system_closing,
+        COALESCE(stk.is_finalized, 0) AS is_finalized,
+
         COALESCE(sa.sales, 0) AS sales,
+        COALESCE(sa.systemSales, 0) AS systemSales,
         COALESCE(sa.salesReturn, 0) AS salesReturn,
         COALESCE(pur.purchase, 0) AS purchase,
         COALESCE(pr.purchaseReturn, 0) AS purchaseReturn,
         COALESCE(def.defective, 0) AS defective,
         (
-          COALESCE(stk.emptyQty, 0) +
+          COALESCE(stk_live.emptyQty, 0) +
           GREATEST(COALESCE(empties.collected, 0) - COALESCE(ret.returned, 0), 0)
         ) AS emptyCylinders,
-        GREATEST(COALESCE(stk.systemQty, 0), 0) AS systemStock
+        COALESCE(stk.system_opening, stk_live.systemQty, 0) AS systemStock
 
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
 
       LEFT JOIN (
         SELECT
+          dss.product_id,
+          COALESCE(SUM(dss.opening_stock), 0) AS opening,
+          COALESCE(SUM(dss.system_opening), 0) AS system_opening,
+          COALESCE(SUM(dss.closing_stock), 0) AS saved_closing_stock,
+          COALESCE(SUM(dss.system_closing), 0) AS saved_system_closing,
+          MIN(dss.is_finalized) AS is_finalized
+        FROM daily_stock_snapshots dss
+        WHERE dss.snapshot_date = ?
+          ${snapshotAreaFilter}
+        GROUP BY dss.product_id
+      ) stk ON stk.product_id = p.id
+
+      LEFT JOIN (
+        SELECT
           s.product_id,
-          COALESCE(SUM(COALESCE(s.quantity, 0)), 0) AS opening,
+          COALESCE(SUM(COALESCE(s.quantity, 0)), 0) AS liveGodownQty,
           COALESCE(SUM(COALESCE(s.system_quantity, 0)), 0) AS systemQty,
-          COALESCE(SUM(COALESCE(s.empty_quantity, 0)), 0) AS emptyQty
+          COALESCE(SUM(COALESCE(s.empty_quantity, 0)), 0) AS emptyQty,
+          COALESCE(SUM(COALESCE(s.system_empty_quantity, 0)), 0) AS systemEmptyQty
         FROM stock s
         ${stockSubAreaFilter}
         GROUP BY s.product_id
-      ) stk ON stk.product_id = p.id
+      ) stk_live ON stk_live.product_id = p.id
 
       LEFT JOIN (
         SELECT
@@ -205,6 +234,15 @@ export const getStockDashboard = async (req, res) => {
         SELECT
           si.product_id,
           SUM(CASE WHEN s.status = 'DELIVERED' THEN COALESCE(NULLIF(si.delivered_qty, 0), si.quantity, 0) ELSE 0 END) AS sales,
+          SUM(
+            CASE
+              WHEN s.status = 'DELIVERED' AND EXISTS (
+                SELECT 1 FROM driver_sale_otps dso
+                WHERE dso.sale_id = s.id AND dso.status = 'SENT'
+              ) THEN COALESCE(NULLIF(si.delivered_qty, 0), si.quantity, 0)
+              ELSE 0
+            END
+          ) AS systemSales,
           SUM(CASE WHEN s.status = 'CANCELLED' THEN COALESCE(NULLIF(si.delivered_qty, 0), si.quantity, 0) ELSE 0 END) AS salesReturn
         FROM sales_items si
         INNER JOIN sales s ON s.id = si.sale_id
@@ -248,6 +286,8 @@ export const getStockDashboard = async (req, res) => {
       OFFSET ?
       `,
       [
+        startDate,
+        ...snapshotAreaParams,
         ...stockSubAreaParams,
         ...txDateParams,
         ...txAreaParams,
@@ -374,9 +414,11 @@ export const getStockDashboard = async (req, res) => {
       LEFT JOIN categories c ON c.id = p.category_id
       LEFT JOIN stock_areas sa ON sa.id = st.stock_area_id
       WHERE st.type = 'NEW_VALUE'
+        AND st.agency_id = ?
       ORDER BY st.created_at DESC, st.id DESC
       LIMIT 15
-      `
+      `,
+      [req.user.agency_id]
     );
 
     const recentEntries = recentEntryRows.map((row) => ({
@@ -389,6 +431,91 @@ export const getStockDashboard = async (req, res) => {
       note: row.note || null,
     }));
 
+    // If viewing the current day, sync live purchases, sales, and closing stock into daily_stock_snapshots
+    if (startDate === today && startDate === endDate) {
+      for (const row of detailsRows) {
+        const pOpening = Number(row.opening || 0);
+        const pPurchase = Number(row.purchase || 0);
+        const pSales = Number(row.sales || 0);
+        const pSysSales = Number(row.systemSales || 0);
+        const pSalesReturn = Number(row.salesReturn || 0);
+        const pPurchaseReturn = Number(row.purchaseReturn || 0);
+        const pDefective = Number(row.defective || 0);
+        const pClosing = pOpening + pPurchase - pSales;
+        const pSysOpening = Number(row.system_opening != null ? row.system_opening : row.systemStock || 0);
+        const pSysClosing = pSysOpening + pPurchase - pSysSales;
+
+        if (stockAreaId) {
+          await connection.query(
+            `
+            UPDATE daily_stock_snapshots
+            SET purchase_qty = ?,
+                sales_qty = ?,
+                system_sales_qty = ?,
+                sales_return_qty = ?,
+                purchase_return_qty = ?,
+                defective_qty = ?,
+                closing_stock = ?,
+                system_closing = ?,
+                updated_at = NOW()
+            WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE()
+            `,
+            [
+              pPurchase,
+              pSales,
+              pSysSales,
+              pSalesReturn,
+              pPurchaseReturn,
+              pDefective,
+              pClosing,
+              pSysClosing,
+              req.user.agency_id,
+              stockAreaId,
+              row.product_id,
+            ]
+          );
+        } else {
+          const [snapshots] = await connection.query(
+            `SELECT id, opening_stock, system_opening FROM daily_stock_snapshots WHERE agency_id = ? AND product_id = ? AND snapshot_date = CURDATE()`,
+            [req.user.agency_id, row.product_id]
+          );
+          for (const ps of snapshots) {
+            const snapOpen = Number(ps.opening_stock || 0);
+            const snapSysOpen = Number(ps.system_opening || 0);
+            const snapClosing = snapOpen + pPurchase - pSales;
+            const snapSysClosing = snapSysOpen + pPurchase - pSysSales;
+
+            await connection.query(
+              `
+              UPDATE daily_stock_snapshots
+              SET purchase_qty = ?,
+                  sales_qty = ?,
+                  system_sales_qty = ?,
+                  sales_return_qty = ?,
+                  purchase_return_qty = ?,
+                  defective_qty = ?,
+                  closing_stock = ?,
+                  system_closing = ?,
+                  updated_at = NOW()
+              WHERE id = ?
+              `,
+              [
+                pPurchase,
+                pSales,
+                pSysSales,
+                pSalesReturn,
+                pPurchaseReturn,
+                pDefective,
+                snapClosing,
+                snapSysClosing,
+                ps.id,
+              ]
+            );
+          }
+        }
+      }
+    }
+
     return res.status(200).json({
       success: true,
       summary: {
@@ -399,7 +526,28 @@ export const getStockDashboard = async (req, res) => {
       data: detailsRows.map((row) => {
         const opening = Number(row.opening || 0);
         const sales = Number(row.sales || 0);
+        const systemSales = Number(row.systemSales || 0);
         const purchase = Number(row.purchase || 0);
+        const purchaseReturn = Number(row.purchaseReturn || 0);
+        const defective = Number(row.defective || 0);
+        const emptyCylinders = Number(row.emptyCylinders || 0);
+
+        // System Opening
+        const systemOpening = Number(row.system_opening != null ? row.system_opening : row.systemStock || 0);
+
+        // Physical Closing = Opening + Purchase - Sales
+        let physicalClosing = opening + purchase - sales;
+
+        // System Closing = System Opening + Purchase - System Sales (Domestic & Commercial OTP confirmed)
+        let systemClosing = systemOpening + purchase - systemSales;
+
+        // If the requested date is in the past and is_finalized = 1, read the saved closing_stock directly:
+        if (startDate < today && Number(row.is_finalized) === 1 && startDate === endDate) {
+          physicalClosing = Number(row.saved_closing_stock || 0);
+          systemClosing = Number(row.saved_system_closing || 0);
+        }
+
+        const systemStock = systemClosing;
 
         return {
           product_id: row.product_id,
@@ -410,15 +558,21 @@ export const getStockDashboard = async (req, res) => {
           category_name: row.category_name || "",
           category: row.category,
           opening,
+          system_opening: systemOpening,
           sales,
+          systemSales,
           salesReturn: Number(row.salesReturn || 0),
           purchase,
-          purchaseReturn: Number(row.purchaseReturn || 0),
-          defective: Number(row.defective || 0),
-          emptyCylinders: Number(row.emptyCylinders || 0),
-          systemStock: Number(row.systemStock || 0),
+          purchaseReturn,
+          defective,
+          emptyCylinders,
+          systemStock,
           // Closing Stock = Opening Stock + Purchase Stock - Sales
-          closingStock: opening + purchase - sales,
+          closingStock: physicalClosing,
+          physicalClosing,
+          systemClosing,
+          difference: physicalClosing - systemClosing,
+          diff: physicalClosing - systemClosing,
         };
       }),
       movements,
@@ -877,6 +1031,13 @@ export const upsertOwnerStockEntry = async (req, res) => {
       stockAreaId = existingArea.id;
     }
 
+    const [[existingStock]] = await connection.query(
+      `SELECT quantity, system_quantity FROM stock WHERE product_id = ? AND stock_area_id = ? AND agency_id = ? FOR UPDATE`,
+      [itemId, stockAreaId, req.user.agency_id]
+    );
+    const physicalDelta = Math.floor(quantity) - Number(existingStock?.quantity || 0);
+    const systemDelta = Math.floor(systemQuantity) - Number(existingStock?.system_quantity || 0);
+
     await connection.query(`UPDATE products SET price = ? WHERE id = ?`, [price, itemId]);
 
     await connection.query(
@@ -891,24 +1052,29 @@ export const upsertOwnerStockEntry = async (req, res) => {
       [itemId, stockAreaId, Math.floor(quantity), Math.floor(systemQuantity), req.user.agency_id]
     );
 
-    await connection.query(
-      `
-      INSERT INTO stock_transactions (
-        product_id,
-        stock_area_id,
-        type,
-        quantity,
-        isApproved,
-        reference_id,
-        created_by,
-        stock_from,
-        is_defective,
-        batch_no,
-        agency_id
-      ) VALUES (?, ?, 'NEW_VALUE', ?, 1, NULL, NULL, 'default', 0, ?, ?)
-      `,
-      [itemId, stockAreaId, Math.floor(quantity), note || null, req.user.agency_id]
-    );
+    for (const [delta, metric] of [[physicalDelta, "physical"], [systemDelta, "system"]]) {
+      if (delta === 0) continue;
+
+      const transactionNote = `${metric} delta${note ? `: ${note}` : ""}`.slice(0, 50);
+      await connection.query(
+        `
+        INSERT INTO stock_transactions (
+          product_id,
+          stock_area_id,
+          type,
+          quantity,
+          isApproved,
+          reference_id,
+          created_by,
+          stock_from,
+          is_defective,
+          batch_no,
+          agency_id
+        ) VALUES (?, ?, 'NEW_VALUE', ?, 1, NULL, ?, 'default', 0, ?, ?)
+        `,
+        [itemId, stockAreaId, delta, req.user.id || null, transactionNote, req.user.agency_id]
+      );
+    }
 
     await connection.commit();
 
@@ -1175,6 +1341,9 @@ export const updateOwnerStockProduct = async (req, res) => {
         ? Number(systemStock)
         : null;
 
+      // Ensure today's snapshot exists
+      await ensureDailyStockSnapshot(connection, req.user.agency_id, null, stockAreaId);
+
       if (newOpening !== null && newSystem !== null) {
         await connection.query(
           `
@@ -1201,6 +1370,36 @@ export const updateOwnerStockProduct = async (req, res) => {
           ON DUPLICATE KEY UPDATE system_quantity = VALUES(system_quantity), updated_at = CURRENT_TIMESTAMP
           `,
           [productId, stockAreaId, Math.floor(newSystem), req.user.agency_id]
+        );
+      }
+
+      // Update today's daily_stock_snapshots for snapshot_date = CURDATE()
+      const [todaySnapshots] = await connection.query(
+        `SELECT id, opening_stock, system_opening, purchase_qty, sales_qty, system_sales_qty FROM daily_stock_snapshots WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE() FOR UPDATE`,
+        [req.user.agency_id, stockAreaId, productId]
+      );
+
+      if (todaySnapshots.length) {
+        const snap = todaySnapshots[0];
+        const updatedOpening = newOpening !== null ? Math.floor(newOpening) : Number(snap.opening_stock || 0);
+        const updatedSystemOpening = newSystem !== null ? Math.floor(newSystem) : Number(snap.system_opening || 0);
+        const purchaseQty = Number(snap.purchase_qty || 0);
+        const salesQty = Number(snap.sales_qty || 0);
+        const systemSalesQty = Number(snap.system_sales_qty || 0);
+        const newClosing = updatedOpening + purchaseQty - salesQty;
+        const newSystemClosing = updatedSystemOpening + purchaseQty - systemSalesQty;
+
+        await connection.query(
+          `
+          UPDATE daily_stock_snapshots
+          SET opening_stock = ?,
+              closing_stock = ?,
+              system_opening = ?,
+              system_closing = ?,
+              updated_at = NOW()
+          WHERE id = ?
+          `,
+          [updatedOpening, newClosing, updatedSystemOpening, newSystemClosing, snap.id]
         );
       }
     }
@@ -1300,6 +1499,11 @@ export const deleteOwnerStockProduct = async (req, res) => {
     await connection.query(
       `DELETE FROM stock_price_history WHERE product_id = ?`,
       [productId]
+    );
+
+    await connection.query(
+      `DELETE FROM daily_stock_snapshots WHERE product_id = ? AND agency_id = ?`,
+      [productId, req.user.agency_id]
     );
 
     await connection.query(

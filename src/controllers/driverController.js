@@ -132,21 +132,23 @@ const resolveDriverId = async (value, queryRunner = db) => {
   return null;
 };
 
-const reserveStockForBooking = async (connection, productId, requiredQty) => {
+const reserveStockForBooking = async (connection, productId, requiredQty, agencyId = 1) => {
   let remaining = Number(requiredQty || 0);
 
   if (remaining <= 0) {
     return;
   }
 
+  const effectiveAgencyId = agencyId || 1;
+
   const [availableRows] = await connection.execute(
     `
     SELECT COALESCE(SUM(quantity), 0) AS available_qty
     FROM stock
-    WHERE product_id = ?
+    WHERE product_id = ? AND agency_id = ?
     FOR UPDATE
     `,
-    [Number(productId)],
+    [Number(productId), effectiveAgencyId],
   );
 
   const availableQty = Number(availableRows[0]?.available_qty || 0);
@@ -161,11 +163,11 @@ const reserveStockForBooking = async (connection, productId, requiredQty) => {
     `
     SELECT id, COALESCE(quantity, 0) AS quantity
     FROM stock
-    WHERE product_id = ?
+    WHERE product_id = ? AND agency_id = ?
     ORDER BY (stock_area_id = ?) DESC, id ASC
     FOR UPDATE
     `,
-    [Number(productId), DEFAULT_STOCK_AREA_ID],
+    [Number(productId), effectiveAgencyId, DEFAULT_STOCK_AREA_ID],
   );
 
   for (const row of rows) {
@@ -195,23 +197,25 @@ const reserveStockForBooking = async (connection, productId, requiredQty) => {
   }
 };
 
-const restoreStockForBooking = async (connection, productId, quantity) => {
+const restoreStockForBooking = async (connection, productId, quantity, agencyId = 1) => {
   const qty = Number(quantity || 0);
 
   if (qty <= 0) {
     return;
   }
 
+  const effectiveAgencyId = agencyId || 1;
+
   const [rows] = await connection.execute(
     `
     SELECT id
     FROM stock
-    WHERE product_id = ?
+    WHERE product_id = ? AND agency_id = ?
     ORDER BY (stock_area_id = ?) DESC, id ASC
     LIMIT 1
     FOR UPDATE
     `,
-    [Number(productId), DEFAULT_STOCK_AREA_ID],
+    [Number(productId), effectiveAgencyId, DEFAULT_STOCK_AREA_ID],
   );
 
   if (rows.length) {
@@ -235,31 +239,34 @@ const restoreStockForBooking = async (connection, productId, quantity) => {
       stock_area_id,
       quantity,
       empty_quantity,
-      defective_quantity
+      defective_quantity,
+      agency_id
     )
-    VALUES (?, ?, ?, 0, 0)
+    VALUES (?, ?, ?, 0, 0, ?)
     `,
-    [Number(productId), DEFAULT_STOCK_AREA_ID, qty],
+    [Number(productId), DEFAULT_STOCK_AREA_ID, qty, effectiveAgencyId],
   );
 };
 
-const addEmptyStockToGodown = async (connection, productId, qty) => {
+const addEmptyStockToGodown = async (connection, productId, qty, agencyId = 1) => {
   const quantity = Number(qty || 0);
 
   if (!quantity || quantity <= 0) {
     return;
   }
 
+  const effectiveAgencyId = agencyId || 1;
+
   const [rows] = await connection.execute(
     `
     SELECT id
     FROM stock
-    WHERE product_id = ?
-    ORDER BY id ASC
+    WHERE product_id = ? AND agency_id = ?
+    ORDER BY (stock_area_id = ?) DESC, id ASC
     LIMIT 1
     FOR UPDATE
     `,
-    [Number(productId)],
+    [Number(productId), effectiveAgencyId, DEFAULT_STOCK_AREA_ID],
   );
 
   if (rows.length) {
@@ -283,11 +290,12 @@ const addEmptyStockToGodown = async (connection, productId, qty) => {
       stock_area_id,
       quantity,
       empty_quantity,
-      defective_quantity
+      defective_quantity,
+      agency_id
     )
-    VALUES (?, NULL, 0, ?, 0)
+    VALUES (?, NULL, 0, ?, 0, ?)
     `,
-    [Number(productId), quantity],
+    [Number(productId), quantity, effectiveAgencyId],
   );
 };
 
@@ -1782,13 +1790,20 @@ export const createDriverReturn = async (req, res) => {
       }
     }
 
-    // Fetch the driver's user_id so it can be used as created_by (matches the
-    // sale flow's stock_transactions attribution).
+    // Fetch the driver's user_id and agency_id so it can be attributed to the correct agency.
     const [driverUserRows] = await connection.execute(
-      `SELECT user_id FROM drivers WHERE id = ? LIMIT 1`,
+      `SELECT d.user_id, d.agency_id AS driver_agency_id, u.agency_id AS user_agency_id
+       FROM drivers d
+       LEFT JOIN users u ON u.id = d.user_id
+       WHERE d.id = ? LIMIT 1`,
       [numericDriverId],
     );
     const driverUserId = driverUserRows[0]?.user_id || null;
+    const effectiveAgencyId =
+      driverUserRows[0]?.driver_agency_id ||
+      driverUserRows[0]?.user_agency_id ||
+      req.user?.agency_id ||
+      1;
 
     await connection.beginTransaction();
 
@@ -1914,6 +1929,7 @@ export const createDriverReturn = async (req, res) => {
       `
       INSERT INTO stock_transactions
       (
+        agency_id,
         product_id,
         stock_area_id,
         type,
@@ -1925,9 +1941,15 @@ export const createDriverReturn = async (req, res) => {
         stock_from,
         is_defective
       )
-      VALUES (?, NULL, 'EMPTY_RETURN', ?, 0, NULL, ?, ?, 'driver', 0)
+      VALUES (?, ?, NULL, 'EMPTY_RETURN', ?, 0, NULL, ?, ?, 'driver', 0)
       `,
-      [numericProductId, numericQuantity, driverUserId, numericDriverId],
+      [
+        effectiveAgencyId,
+        numericProductId,
+        numericQuantity,
+        driverUserId,
+        numericDriverId,
+      ],
     );
 
     await connection.execute(
@@ -3140,10 +3162,26 @@ export const createEmptyCylinderReturnRequest = async (req, res) => {
       });
     }
 
+    let driverAgencyId = req.user?.agency_id;
+    if (!driverAgencyId && numericDriverId) {
+      const [driverRows] = await connection.execute(
+        `SELECT d.agency_id AS driver_agency_id, u.agency_id AS user_agency_id
+         FROM drivers d
+         LEFT JOIN users u ON u.id = d.user_id
+         WHERE d.id = ?
+         LIMIT 1`,
+        [numericDriverId],
+      );
+      driverAgencyId =
+        driverRows[0]?.driver_agency_id || driverRows[0]?.user_agency_id;
+    }
+    const effectiveAgencyId = driverAgencyId || 1;
+
     await connection.execute(
       `
       INSERT INTO stock_transactions
       (
+        agency_id,
         product_id,
         stock_area_id,
         type,
@@ -3155,9 +3193,10 @@ export const createEmptyCylinderReturnRequest = async (req, res) => {
         stock_from,
         is_defective
       )
-      VALUES (?, NULL, 'EMPTY_RETURN', ?, 0, ?, ?, ?, 'driver', 0)
+      VALUES (?, ?, NULL, 'EMPTY_RETURN', ?, 0, ?, ?, ?, 'driver', 0)
       `,
       [
+        effectiveAgencyId,
         numericProductId,
         numericQuantity,
         Date.now(),
@@ -3392,7 +3431,7 @@ export const approveTodayEmptyCylinderReturns = async (req, res) => {
       );
 
       if (productId && qty > 0) {
-        await addEmptyStockToGodown(connection, productId, qty);
+        await addEmptyStockToGodown(connection, productId, qty, req.user?.agency_id);
       }
     }
 
@@ -4071,6 +4110,21 @@ export const createInHandRequest = async (req, res) => {
       });
     }
 
+    let driverAgencyId = req.user?.agency_id;
+    if (!driverAgencyId && numericDriverId) {
+      const [driverRows] = await connection.execute(
+        `SELECT d.agency_id AS driver_agency_id, u.agency_id AS user_agency_id
+         FROM drivers d
+         LEFT JOIN users u ON u.id = d.user_id
+         WHERE d.id = ?
+         LIMIT 1`,
+        [numericDriverId],
+      );
+      driverAgencyId =
+        driverRows[0]?.driver_agency_id || driverRows[0]?.user_agency_id;
+    }
+    const effectiveAgencyId = driverAgencyId || 1;
+
     await connection.beginTransaction();
 
     for (const item of validItems) {
@@ -4166,6 +4220,7 @@ export const createInHandRequest = async (req, res) => {
         `
         INSERT INTO stock_transactions
         (
+          agency_id,
           product_id,
           stock_area_id,
           type,
@@ -4180,9 +4235,10 @@ export const createInHandRequest = async (req, res) => {
           allocation_sale_id,
           allocation_sales_item_id
         )
-        VALUES (?, NULL, 'PURCHASE_RETURN', ?, 0, ?, ?, ?, 'driver', ?, ?, ?, ?)
+        VALUES (?, ?, NULL, 'PURCHASE_RETURN', ?, 0, ?, ?, ?, 'driver', ?, ?, ?, ?)
         `,
         [
+          effectiveAgencyId,
           numericProductId,
           numericQuantity,
           allocationSaleId || Date.now(),

@@ -2,10 +2,9 @@ import db from "../config/db.js";
 
 const DEFAULT_STOCK_AREA_ID = 1;
 
-// Adds `qty` to the running system_quantity tally for a product, on the
-// canonical stock row (default area preferred, otherwise the lowest-id row).
-// Creates a stock row if none exists. Floored at 0.
-const addSystemQuantity = async (connection, productId, qty, agencyId = 1) => {
+// IOC confirmation records a sale in the system ledger, so it reduces the
+// system stock baseline on the canonical stock row and increases system empty stock. Creates a row if needed.
+const deductSystemQuantity = async (connection, productId, qty, agencyId = 1) => {
   const amount = Number(qty || 0);
 
   if (!Number(productId) || amount <= 0) {
@@ -28,20 +27,38 @@ const addSystemQuantity = async (connection, productId, qty, agencyId = 1) => {
     await connection.query(
       `
       UPDATE stock
-      SET system_quantity = GREATEST(COALESCE(system_quantity, 0) + ?, 0),
+      SET system_quantity = GREATEST(COALESCE(system_quantity, 0) - ?, 0),
+          system_empty_quantity = COALESCE(system_empty_quantity, 0) + ?,
           updated_at = NOW()
       WHERE id = ?
       `,
-      [amount, rows[0].id]
+      [amount, amount, rows[0].id]
     );
   } else {
     await connection.query(
       `
-      INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, agency_id)
-      VALUES (?, ?, 0, GREATEST(?, 0), ?)
+      INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, empty_quantity, system_empty_quantity, agency_id)
+      VALUES (?, ?, 0, 0, 0, ?, ?)
       `,
       [Number(productId), DEFAULT_STOCK_AREA_ID, amount, agencyId]
     );
+  }
+
+  // Reflect in today's daily_stock_snapshots
+  try {
+    await connection.query(
+      `
+      UPDATE daily_stock_snapshots
+      SET system_sales_qty = system_sales_qty + ?,
+          system_closing = system_closing - ?,
+          system_empty_closing = system_empty_closing + ?,
+          updated_at = NOW()
+      WHERE agency_id = ? AND product_id = ? AND snapshot_date = CURDATE()
+      `,
+      [amount, amount, amount, agencyId, Number(productId)]
+    );
+  } catch (err) {
+    console.warn("Could not sync daily_stock_snapshots in deductSystemQuantity:", err.message);
   }
 };
 
@@ -237,7 +254,7 @@ export const markIocOtpSent = async (req, res) => {
       );
 
       for (const item of items) {
-        await addSystemQuantity(connection, item.product_id, item.quantity, agencyId);
+        await deductSystemQuantity(connection, item.product_id, item.quantity, agencyId);
       }
     }
 

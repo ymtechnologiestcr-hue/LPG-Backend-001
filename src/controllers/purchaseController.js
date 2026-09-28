@@ -3,6 +3,7 @@ import {
   completeEmptyLoadInTransaction,
   ensureEmptyCylinderLoadTables,
 } from "./emptyCylinderLoadController.js";
+import { recordPurchaseInDailySnapshot } from "../utils/stockLedger.js";
 
 const DEFAULT_PURCHASE_STOCK_AREA_ID = 2;
 const purchaseTripColumnCache = new Map();
@@ -1661,7 +1662,7 @@ const _markLoadStockWaiting = async (connection, loadId) => {
 const _approveLoadStock = async (connection, loadId) => {
   const [txRows] = await connection.query(
     `
-    SELECT id, product_id, stock_area_id, quantity
+    SELECT id, product_id, stock_area_id, quantity, agency_id
     FROM stock_transactions
     WHERE type = 'PURCHASE'
       AND reference_id = ?
@@ -1675,6 +1676,7 @@ const _approveLoadStock = async (connection, loadId) => {
     const productId = Number(tx.product_id);
     const stockAreaId = Number(tx.stock_area_id);
     const qty = Number(tx.quantity || 0);
+    const agencyId = Number(tx.agency_id || 1);
 
     const [stockRows] = await connection.query(
       `
@@ -1694,11 +1696,14 @@ const _approveLoadStock = async (connection, loadId) => {
       );
     } else {
       await connection.query(
-        `INSERT INTO stock (product_id, stock_area_id, quantity, quantity_return, empty_quantity, defective_quantity)
-         VALUES (?, ?, ?, 0, 0, 0)`,
-        [productId, stockAreaId, qty],
+        `INSERT INTO stock (product_id, stock_area_id, quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
+         VALUES (?, ?, ?, 0, 0, 0, ?)`,
+        [productId, stockAreaId, qty, agencyId],
       );
     }
+
+    // Increment today's purchase_qty and closing_stock in daily snapshot without touching opening_stock
+    await recordPurchaseInDailySnapshot(connection, agencyId, stockAreaId, productId, qty);
   }
 
   if (txRows.length) {
@@ -2363,7 +2368,8 @@ export const syncPurchaseApprovalState = async (connection, loadId, agencyId) =>
       UPDATE purchase_trips
       SET status = 'APPROVED'
       WHERE id = ?
-        AND status IN ('WAITING_APPROVAL', 'IN_PROGRESS')
+        AND status IN ('WAITING_APPROVAL', 'COMPLETED')
+        AND ended_at IS NOT NULL
       `,
       [tripId],
     );

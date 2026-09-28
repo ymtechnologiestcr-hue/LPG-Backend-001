@@ -4,6 +4,7 @@ import {
   CARRY_FORWARD_DATE_EXPR,
   getDriverCarryForward,
 } from "../utils/driverCarryForward.js";
+import { recordPurchaseInDailySnapshot } from "../utils/stockLedger.js";
 
 const DEFAULT_STOCK_AREA_ID = 1;
 const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -43,19 +44,23 @@ const increaseStock = async (
   {
     productId,
     quantity = 0,
+    systemQuantity = 0,
     returnQuantity = 0,
     emptyQuantity = 0,
+    systemEmptyQuantity = 0,
     defectiveQuantity = 0,
   },
   agencyId = 1
 ) => {
   const effectiveAgencyId = agencyId || 1;
   const qty = Number(quantity || 0);
+  const sysQty = Number(systemQuantity || 0);
   const returnQty = Number(returnQuantity || 0);
   const emptyQty = Number(emptyQuantity || 0);
+  const sysEmptyQty = Number(systemEmptyQuantity || 0);
   const defectiveQty = Number(defectiveQuantity || 0);
 
-  if (qty === 0 && returnQty === 0 && emptyQty === 0 && defectiveQty === 0) {
+  if (qty === 0 && sysQty === 0 && returnQty === 0 && emptyQty === 0 && sysEmptyQty === 0 && defectiveQty === 0) {
     return;
   }
 
@@ -77,13 +82,15 @@ const increaseStock = async (
       UPDATE stock
       SET
         quantity = COALESCE(quantity, 0) + ?,
+        system_quantity = COALESCE(system_quantity, 0) + ?,
         quantity_return = COALESCE(quantity_return, 0) + ?,
         empty_quantity = COALESCE(empty_quantity, 0) + ?,
+        system_empty_quantity = COALESCE(system_empty_quantity, 0) + ?,
         defective_quantity = COALESCE(defective_quantity, 0) + ?,
         updated_at = NOW()
       WHERE id = ?
       `,
-      [qty, returnQty, emptyQty, defectiveQty, rows[0].id]
+      [qty, sysQty, returnQty, emptyQty, sysEmptyQty, defectiveQty, rows[0].id]
     );
     return;
   }
@@ -95,14 +102,16 @@ const increaseStock = async (
       product_id,
       stock_area_id,
       quantity,
+      system_quantity,
       quantity_return,
       empty_quantity,
+      system_empty_quantity,
       defective_quantity,
       agency_id
     )
-    VALUES (?, NULL, ?, ?, ?, ?, ?)
+    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
     `,
-    [productId, qty, returnQty, emptyQty, defectiveQty, effectiveAgencyId]
+    [productId, qty, sysQty, returnQty, emptyQty, sysEmptyQty, defectiveQty, effectiveAgencyId]
   );
 };
 
@@ -172,7 +181,10 @@ const getStockMetricTotalForUpdate = async (
   agencyId
 ) => {
   const safeColumn =
-    metricColumn === "empty_quantity" || metricColumn === "defective_quantity"
+    metricColumn === "empty_quantity" ||
+    metricColumn === "system_empty_quantity" ||
+    metricColumn === "defective_quantity" ||
+    metricColumn === "system_quantity"
       ? metricColumn
       : null;
 
@@ -201,7 +213,10 @@ const consumeStockMetric = async (
   agencyId
 ) => {
   const safeColumn =
-    metricColumn === "empty_quantity" || metricColumn === "defective_quantity"
+    metricColumn === "empty_quantity" ||
+    metricColumn === "system_empty_quantity" ||
+    metricColumn === "defective_quantity" ||
+    metricColumn === "system_quantity"
       ? metricColumn
       : null;
 
@@ -266,6 +281,7 @@ export const getGodownDashboardData = async (req, res) => {
         COALESCE(SUM(s.quantity), 0) AS physical_quantity,
         COALESCE(SUM(s.system_quantity), 0) AS system_quantity,
         COALESCE(SUM(s.empty_quantity), 0) AS empty_quantity,
+        COALESCE(SUM(s.system_empty_quantity), 0) AS system_empty_quantity,
         COALESCE(SUM(s.defective_quantity), 0) AS defective_quantity
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
@@ -291,7 +307,7 @@ export const getGodownDashboardData = async (req, res) => {
         st.product_id,
         COALESCE(SUM(st.quantity), 0) AS stock_in
       FROM stock_transactions st
-      WHERE st.type IN ('PURCHASE', 'NEW_VALUE', 'ADJUSTMENT_ADD')
+      WHERE st.type IN ('PURCHASE', 'ADJUSTMENT_ADD')
         AND COALESCE(st.isApproved, 0) = 1
         AND COALESCE(st.is_defective, 0) = 0
         AND st.agency_id = ?
@@ -310,7 +326,7 @@ export const getGodownDashboardData = async (req, res) => {
         ON linked_sale.id = st.reference_id
        AND linked_sale.driver_id = st.driver_id
       WHERE st.driver_id IS NOT NULL
-        AND COALESCE(st.isApproved, 0) = 0
+        AND COALESCE(st.isApproved, 0) = 1
         AND st.agency_id = ?
         AND DATE(st.created_at) BETWEEN ? AND ?
         AND st.type IN ('EMPTY_RETURN', 'PURCHASE_RETURN')
@@ -381,25 +397,27 @@ export const getGodownDashboardData = async (req, res) => {
       const key = group === "COMMERCIAL" ? "commercial" : "domestic";
 
       // physical = actual on-hand stock (stock.quantity)
-      // system   = opening stock (IOC baseline in stock.system_quantity)
-      //            + stock in (approved cylinders received into the godown)
+      // system   = stock.system_quantity, which now accumulates:
+      //            IOC baseline (markIocOtpSent) + purchase approvals (approveStockInLoad)
+      //            and is decremented by stock-out (createStockOutLoad)
       const physicalQty = Number(row.physical_quantity || 0);
       const systemQty = Number(row.system_quantity || 0);
-      const stockInQty = stockInByProduct[Number(row.product_id)] ?? 0;
-      const systemTotal = Math.max(systemQty + stockInQty, 0);
+      const systemTotal = Math.max(systemQty, 0);
       const emptyQty = Number(row.empty_quantity || 0);
+      const systemEmptyQty = Number(row.system_empty_quantity || 0);
       const defectiveQty = Number(row.defective_quantity || 0);
 
       const availablePhysical = Math.max(physicalQty, 0);
       const defectivePhysical = Math.max(defectiveQty, 0);
       const emptyPhysical = Math.max(emptyQty, 0);
+      const emptySystem = Math.max(systemEmptyQty, 0);
 
       initial.available[key].system += systemTotal;
       initial.available[key].defective += defectivePhysical;
       initial.available[key].total += availablePhysical;
 
       initial.empty[key].total += emptyPhysical;
-      initial.empty[key].system += emptyPhysical;
+      initial.empty[key].system += emptySystem;
 
       initial.available[key].items.push({
         product_id: row.product_id,
@@ -517,6 +535,7 @@ export const getStockDetailByType = async (req, res) => {
         COALESCE(SUM(s.quantity), 0) AS quantity,
         COALESCE(SUM(s.system_quantity), 0) AS system_quantity,
         COALESCE(SUM(s.empty_quantity), 0) AS empty_quantity,
+        COALESCE(SUM(s.system_empty_quantity), 0) AS system_empty_quantity,
         COALESCE(SUM(s.defective_quantity), 0) AS defective_quantity
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
@@ -638,16 +657,17 @@ export const getStockDetailByType = async (req, res) => {
       let physical, system, quantityValue;
 
       if (isEmptyView) {
-        // system   = what drivers collected (sales_items — same source as driver app)
         // physical = stock.empty_quantity (approved and received at godown)
+        // system   = stock.system_empty_quantity (confirmed in IOC), fallback to collected empties if uninitialized
         physical = emptyQty;
-        system = emptyReturnByProduct[Number(row.product_id)] ?? 0;
+        const trackedSysEmpty = Number(row.system_empty_quantity || 0);
+        system = trackedSysEmpty > 0 ? trackedSysEmpty : (emptyReturnByProduct[Number(row.product_id)] ?? 0);
         quantityValue = Math.max(qty, 0);
       } else {
         // physical = total unsold = godown on-hand + cylinders in hand with drivers
         const inHand = driverInHandByProduct[Number(row.product_id)] ?? 0;
         physical = Math.max(qty, 0) + inHand;
-        // system = physical + cylinders sold whose OTP is still pending
+        // Both Commercial and Domestic: system = physical + cylinders sold whose OTP is still pending
         const pendingOtp = pendingOtpByProduct[Number(row.product_id)] ?? 0;
         system = physical + pendingOtp;
         quantityValue = physical;
@@ -776,6 +796,7 @@ export const getStockInLoads = async (req, res) => {
         pl.invoice_url,
         pt.id AS trip_id,
         pt.status AS trip_status,
+        pt.ended_at AS trip_ended_at,
         pu.id AS driver_id,
         pu.name AS driver_name,
         COALESCE(ujp.vehicle_number, d.vehicle_number, 'N/A') AS vehicle_number
@@ -796,18 +817,13 @@ export const getStockInLoads = async (req, res) => {
         pl.invoice_url,
         pt.id,
         pt.status,
+        pt.ended_at,
         pu.id,
         pu.name,
         ujp.vehicle_number,
         d.vehicle_number
       ORDER BY pl.created_at DESC
     `, [agencyId]);
-
-    const mapStatus = (status) => {
-      if (status === "APPROVED") return "APPROVED";
-      if (status === "PENDING") return "WAITING_APPROVAL";
-      return "IN_PROGRESS";
-    };
 
     const loadIdSet = new Set(purchaseLoads.map((r) => Number(r.load_id)));
 
@@ -821,11 +837,16 @@ export const getStockInLoads = async (req, res) => {
         MIN(st.isApproved) AS isApproved,
         d.id AS driver_id,
         COALESCE(ujp.vehicle_number, d.vehicle_number, 'N/A') AS vehicle_number,
-        COALESCE(pu.name, u.name, 'Unknown Driver') AS driver_name
+        COALESCE(pu.name, u.name, 'Unknown Driver') AS driver_name,
+        pt.id AS trip_id,
+        pt.status AS trip_status,
+        pt.ended_at AS trip_ended_at
       FROM stock_transactions st
       LEFT JOIN drivers d ON d.id = st.driver_id
       LEFT JOIN users u ON u.id = d.user_id
-      LEFT JOIN users pu ON pu.id = st.created_by
+      LEFT JOIN purchase_loads pl ON pl.id = st.reference_id
+      LEFT JOIN purchase_trips pt ON pt.id = pl.trip_id
+      LEFT JOIN users pu ON pu.id = COALESCE(pl.created_by, pt.purchase_manager_id, st.created_by)
       LEFT JOIN user_job_profiles ujp ON ujp.user_id = COALESCE(pu.id, u.id)
       WHERE st.type = 'PURCHASE' AND st.agency_id = ?
       GROUP BY
@@ -835,7 +856,10 @@ export const getStockInLoads = async (req, res) => {
         ujp.vehicle_number,
         d.vehicle_number,
         pu.name,
-        u.name
+        u.name,
+        pt.id,
+        pt.status,
+        pt.ended_at
       ORDER BY created_at DESC
     `, [agencyId]);
 
@@ -843,6 +867,21 @@ export const getStockInLoads = async (req, res) => {
     let index = 1;
 
     for (const row of purchaseLoads) {
+      const isTripActive = Boolean(
+        row.trip_id && (row.trip_status === "IN_PROGRESS" || !row.trip_ended_at)
+      );
+      const canApprove = !isTripActive && row.load_status === "PENDING";
+      const status =
+        row.load_status === "APPROVED"
+          ? "APPROVED"
+          : row.load_status === "CANCELLED"
+          ? "CANCELLED"
+          : isTripActive
+          ? "TRIP_IN_PROGRESS"
+          : row.load_status === "PENDING"
+          ? "WAITING_APPROVAL"
+          : "IN_PROGRESS";
+
       result.push({
         id: row.load_id,
         load: `Load-${index++}`,
@@ -852,12 +891,31 @@ export const getStockInLoads = async (req, res) => {
         invoice: row.invoice_number || `INV-${row.load_id}`,
         vehicle: row.vehicle_number || "N/A",
         qty: Number(row.total_quantity || 0),
-        status: mapStatus(row.load_status),
+        status,
+        rawStatus: row.load_status,
+        tripId: row.trip_id || null,
+        tripStatus: row.trip_status || null,
+        tripEndedAt: row.trip_ended_at || null,
+        isTripActive,
+        canApprove,
       });
     }
 
     for (const row of txRows) {
       if (!loadIdSet.has(Number(row.load_id))) {
+        const isTripActive = Boolean(
+          row.trip_id && (row.trip_status === "IN_PROGRESS" || !row.trip_ended_at)
+        );
+        const canApprove = !isTripActive && Number(row.isApproved) === 2;
+        const status =
+          Number(row.isApproved) === 1
+            ? "APPROVED"
+            : isTripActive
+            ? "TRIP_IN_PROGRESS"
+            : Number(row.isApproved) === 2
+            ? "WAITING_APPROVAL"
+            : "IN_PROGRESS";
+
         result.push({
           id: row.load_id,
           load: `Load-${index++}`,
@@ -867,12 +925,18 @@ export const getStockInLoads = async (req, res) => {
           invoice: `INV-${row.load_id}`,
           vehicle: row.vehicle_number || "N/A",
           qty: Number(row.total_quantity || 0),
-          status:
-            Number(row.isApproved) === 1
+          status,
+          rawStatus:
+            Number(row.isApproved) === 2
+              ? "PENDING"
+              : Number(row.isApproved) === 1
               ? "APPROVED"
-              : Number(row.isApproved) === 2
-                ? "WAITING_APPROVAL"
-                : "IN_PROGRESS",
+              : "DRAFT",
+          tripId: row.trip_id || null,
+          tripStatus: row.trip_status || null,
+          tripEndedAt: row.trip_ended_at || null,
+          isTripActive,
+          canApprove,
         });
       }
     }
@@ -908,6 +972,10 @@ export const getStockInLoadDetail = async (req, res) => {
         pl.invoice_url,
         pl.invoice_number,
         pl.stock_area_id,
+        pl.trip_id,
+        pt.id AS pt_trip_id,
+        pt.status AS trip_status,
+        pt.ended_at AS trip_ended_at,
         p.name AS product_name,
         p.type AS product_type,
         c.name AS category_name,
@@ -933,8 +1001,16 @@ export const getStockInLoadDetail = async (req, res) => {
         0
       );
 
+      const tripId = loadRows[0].trip_id || loadRows[0].pt_trip_id || null;
+      const tripStatus = loadRows[0].trip_status || null;
+      const tripEndedAt = loadRows[0].trip_ended_at || null;
+      const isTripActive = Boolean(tripId && (tripStatus === "IN_PROGRESS" || !tripEndedAt));
+      const canApprove = !isTripActive && loadRows[0].load_status === "PENDING";
+
       const mapStatus = (status) => {
         if (status === "APPROVED") return "APPROVED";
+        if (status === "CANCELLED") return "CANCELLED";
+        if (isTripActive) return "TRIP_IN_PROGRESS";
         if (status === "PENDING") return "WAITING_APPROVAL";
         return "IN_PROGRESS";
       };
@@ -952,6 +1028,12 @@ export const getStockInLoadDetail = async (req, res) => {
           invoiceImageUrl: loadRows[0].invoice_url || null,
           qty: totalQty,
           status: mapStatus(loadRows[0].load_status),
+          rawStatus: loadRows[0].load_status,
+          tripId,
+          tripStatus,
+          tripEndedAt,
+          isTripActive,
+          canApprove,
           items: loadRows.map((row) => ({
             transaction_id: row.item_id,
             product_id: row.product_id,
@@ -984,7 +1066,11 @@ export const getStockInLoadDetail = async (req, res) => {
         COALESCE(ujp.vehicle_number, d.vehicle_number, 'N/A') AS vehicle_number,
         COALESCE(pu.name, u.name, 'Unknown Driver') AS driver_name,
         pl.invoice_url,
-        pl.invoice_number
+        pl.invoice_number,
+        pl.trip_id,
+        pt.id AS pt_trip_id,
+        pt.status AS trip_status,
+        pt.ended_at AS trip_ended_at
       FROM stock_transactions st
       JOIN products p ON p.id = st.product_id
       LEFT JOIN categories c ON c.id = p.category_id
@@ -1014,6 +1100,12 @@ export const getStockInLoadDetail = async (req, res) => {
       0
     );
 
+    const tripId = rows[0].trip_id || rows[0].pt_trip_id || null;
+    const tripStatus = rows[0].trip_status || null;
+    const tripEndedAt = rows[0].trip_ended_at || null;
+    const isTripActive = Boolean(tripId && (tripStatus === "IN_PROGRESS" || !tripEndedAt));
+    const canApprove = !isTripActive && Number(rows[0].isApproved) === 2;
+
     return res.json({
       success: true,
       data: {
@@ -1029,9 +1121,22 @@ export const getStockInLoadDetail = async (req, res) => {
         status:
           Number(rows[0].isApproved) === 1
             ? "APPROVED"
+            : isTripActive
+            ? "TRIP_IN_PROGRESS"
             : Number(rows[0].isApproved) === 2
               ? "WAITING_APPROVAL"
               : "IN_PROGRESS",
+        rawStatus:
+          Number(rows[0].isApproved) === 2
+            ? "PENDING"
+            : Number(rows[0].isApproved) === 1
+            ? "APPROVED"
+            : "DRAFT",
+        tripId,
+        tripStatus,
+        tripEndedAt,
+        isTripActive,
+        canApprove,
         items: rows.map((row) => ({
           transaction_id: row.id,
           product_id: row.product_id,
@@ -1063,8 +1168,10 @@ export const approveStockInLoad = async (req, res) => {
     // 1. Check purchase_loads first
     const [loadRows] = await connection.execute(
       `
-      SELECT pl.id, pl.status, pl.stock_area_id, pl.created_by, pl.trip_id
+      SELECT pl.id, pl.status, pl.stock_area_id, pl.created_by, pl.trip_id,
+             pt.status AS trip_status, pt.ended_at AS trip_ended_at
       FROM purchase_loads pl
+      LEFT JOIN purchase_trips pt ON pt.id = pl.trip_id
       WHERE pl.id = ? AND pl.agency_id = ?
       `,
       [loadId, agencyId]
@@ -1091,6 +1198,18 @@ export const approveStockInLoad = async (req, res) => {
         });
       }
 
+      // Check if associated trip is still active
+      if (loadRows[0].trip_id) {
+        const isTripActive = loadRows[0].trip_status === "IN_PROGRESS" || !loadRows[0].trip_ended_at;
+        if (isTripActive) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: "Cannot approve stock while trip is active. The purchase driver must complete End Trip first.",
+          });
+        }
+      }
+
       const [itemRows] = await connection.execute(
         `
         SELECT id, product_id, quantity
@@ -1105,15 +1224,30 @@ export const approveStockInLoad = async (req, res) => {
       // Fallback: check stock_transactions
       const [txRows] = await connection.execute(
         `
-        SELECT id, product_id, quantity
-        FROM stock_transactions
-        WHERE type = 'PURCHASE'
-          AND COALESCE(reference_id, driver_id) = ?
-          AND isApproved = 2
-          AND agency_id = ?
+        SELECT st.id, st.product_id, st.quantity, pl.trip_id,
+               pt.status AS trip_status, pt.ended_at AS trip_ended_at
+        FROM stock_transactions st
+        LEFT JOIN purchase_loads pl ON pl.id = st.reference_id
+        LEFT JOIN purchase_trips pt ON pt.id = pl.trip_id
+        WHERE st.type = 'PURCHASE'
+          AND COALESCE(st.reference_id, st.driver_id) = ?
+          AND st.isApproved = 2
+          AND st.agency_id = ?
         `,
         [loadId, agencyId]
       );
+
+      if (txRows.length && txRows[0].trip_id) {
+        const isTripActive = txRows[0].trip_status === "IN_PROGRESS" || !txRows[0].trip_ended_at;
+        if (isTripActive) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: "Cannot approve stock while trip is active. The purchase driver must complete End Trip first.",
+          });
+        }
+      }
+
       itemsToApprove = txRows;
     }
 
@@ -1125,12 +1259,22 @@ export const approveStockInLoad = async (req, res) => {
       });
     }
 
-    // Increase stock in godown
+    // Increase physical + system stock in godown on purchase approval
     for (const row of itemsToApprove) {
       await increaseStock(connection, {
         productId: Number(row.product_id),
         quantity: Number(row.quantity || 0),
+        systemQuantity: Number(row.quantity || 0), // system stock mirrors physical on purchase
       }, agencyId);
+
+      const effectiveAreaId = loadRows[0]?.stock_area_id || DEFAULT_STOCK_AREA_ID || 1;
+      await recordPurchaseInDailySnapshot(
+        connection,
+        agencyId,
+        effectiveAreaId,
+        Number(row.product_id),
+        Number(row.quantity || 0)
+      );
     }
 
     // Ensure stock_transactions are marked approved (isApproved = 1)
@@ -1509,6 +1653,23 @@ export const createStockOutLoad = async (req, res) => {
         );
 
         await consumeStockMetric(connection, productId, "empty_quantity", emptyQty, req.user.agency_id);
+        // Deduct system empty stock — return trip reduces empty system stock (Image 2 - Section 6)
+        await consumeStockMetric(connection, productId, "system_empty_quantity", emptyQty, req.user.agency_id);
+
+        try {
+          await connection.query(
+            `
+            UPDATE daily_stock_snapshots
+            SET empty_closing = GREATEST(COALESCE(empty_closing, 0) - ?, 0),
+                system_empty_closing = GREATEST(COALESCE(system_empty_closing, 0) - ?, 0),
+                updated_at = NOW()
+            WHERE agency_id = ? AND product_id = ? AND snapshot_date = CURDATE()
+            `,
+            [emptyQty, emptyQty, req.user.agency_id, productId]
+          );
+        } catch (e) {
+          console.warn("Could not sync empty_closing in createStockOutLoad:", e.message);
+        }
       }
 
       if (defectiveQty > 0) {
@@ -2583,6 +2744,7 @@ export const createDriverAllocation = async (req, res) => {
 export const getReturnsToday = async (req, res) => {
   try {
     const { startDate, endDate } = resolveDateRange(req.query);
+    const agencyId = req.user?.agency_id || 1;
 
     const [drivers] = await db.execute(
       `
@@ -2598,6 +2760,7 @@ export const getReturnsToday = async (req, res) => {
       JOIN users u ON u.id = d.user_id
       WHERE st.driver_id IS NOT NULL
         AND st.isApproved = 0
+        AND (st.agency_id = ? OR d.agency_id = ? OR u.agency_id = ?)
         AND DATE(st.created_at) BETWEEN ? AND ?
         AND st.type IN ('EMPTY_RETURN', 'PURCHASE_RETURN')
         AND (
@@ -2606,7 +2769,7 @@ export const getReturnsToday = async (req, res) => {
         )
       ORDER BY u.name ASC
       `,
-      [startDate, endDate]
+      [agencyId, agencyId, agencyId, startDate, endDate]
     );
 
     const [rows] = await db.execute(
@@ -2630,8 +2793,11 @@ export const getReturnsToday = async (req, res) => {
        AND linked_sale.driver_id = st.driver_id
       JOIN products p ON p.id = st.product_id
       LEFT JOIN categories c ON c.id = p.category_id
+      JOIN drivers d ON d.id = st.driver_id
+      JOIN users u ON u.id = d.user_id
       WHERE st.driver_id IS NOT NULL
         AND st.isApproved = 0
+        AND (st.agency_id = ? OR d.agency_id = ? OR u.agency_id = ?)
         AND DATE(st.created_at) BETWEEN ? AND ?
         AND st.type IN ('EMPTY_RETURN', 'PURCHASE_RETURN')
         AND (
@@ -2640,7 +2806,7 @@ export const getReturnsToday = async (req, res) => {
         )
       ORDER BY st.created_at DESC
       `,
-      [startDate, endDate]
+      [agencyId, agencyId, agencyId, startDate, endDate]
     );
 
     const data = drivers.map((driver) => {
@@ -2721,7 +2887,6 @@ export const approveReturnByCondition = async (req, res) => {
 
   try {
     const { driver_id, condition } = req.body;
-    const agencyId = req.user?.agency_id || 1;
 
     if (!driver_id || !condition) {
       return res.status(400).json({
@@ -2729,6 +2894,20 @@ export const approveReturnByCondition = async (req, res) => {
         message: "driver_id and condition are required",
       });
     }
+
+    let targetAgencyId = req.user?.agency_id;
+    if (!targetAgencyId && driver_id) {
+      const [driverRows] = await connection.execute(
+        `SELECT d.agency_id AS driver_agency_id, u.agency_id AS user_agency_id
+         FROM drivers d
+         LEFT JOIN users u ON u.id = d.user_id
+         WHERE d.id = ?
+         LIMIT 1`,
+        [driver_id]
+      );
+      targetAgencyId = driverRows[0]?.driver_agency_id || driverRows[0]?.user_agency_id;
+    }
+    const effectiveAgencyId = targetAgencyId || 1;
 
     let selectTypeCondition = "";
     let updateTypeCondition = "";
@@ -2779,33 +2958,47 @@ export const approveReturnByCondition = async (req, res) => {
     }
 
     for (const row of rows) {
-      const rowAgencyId = row.agency_id || agencyId;
       if (condition === "empty") {
         await increaseStock(connection, {
           productId: Number(row.product_id),
           emptyQuantity: Number(row.quantity || 0),
-        }, rowAgencyId);
+        }, effectiveAgencyId);
+
+        try {
+          await connection.query(
+            `
+            UPDATE daily_stock_snapshots
+            SET empty_closing = COALESCE(empty_closing, 0) + ?,
+                updated_at = NOW()
+            WHERE agency_id = ? AND product_id = ? AND snapshot_date = CURDATE()
+            `,
+            [Number(row.quantity || 0), effectiveAgencyId, Number(row.product_id)]
+          );
+        } catch (e) {
+          console.warn("Could not sync empty_closing in approveReturnByCondition:", e.message);
+        }
       }
 
       if (condition === "normal") {
         await increaseStock(connection, {
           productId: Number(row.product_id),
           quantity: Number(row.quantity || 0),
-        }, rowAgencyId);
+        }, effectiveAgencyId);
       }
 
       if (condition === "defective") {
         await increaseStock(connection, {
           productId: Number(row.product_id),
           defectiveQuantity: Number(row.quantity || 0),
-        }, rowAgencyId);
+        }, effectiveAgencyId);
       }
     }
 
     await connection.execute(
       `
       UPDATE stock_transactions st
-      SET isApproved = 1
+      SET isApproved = 1,
+          agency_id = ?
       WHERE st.driver_id = ?
         AND st.isApproved = 0
         AND (
@@ -2817,7 +3010,7 @@ export const approveReturnByCondition = async (req, res) => {
         )
         AND ${updateTypeCondition}
       `,
-      [driver_id, driver_id]
+      [effectiveAgencyId, driver_id, driver_id]
     );
 
     await connection.commit();
@@ -2942,8 +3135,8 @@ export const approveTransferEmptyReturn = async (req, res) => {
     }, agencyId);
 
     await connection.execute(
-      `UPDATE stock_transactions SET isApproved = 1 WHERE id = ?`,
-      [txnId]
+      `UPDATE stock_transactions SET isApproved = 1, agency_id = ? WHERE id = ?`,
+      [agencyId, txnId]
     );
 
     await connection.commit();

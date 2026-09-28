@@ -83,10 +83,11 @@ const consumeEmptyStock = async (connection, productId, requiredQty, agencyId) =
       `
       UPDATE stock
       SET empty_quantity = GREATEST(COALESCE(empty_quantity, 0) - ?, 0),
+          system_empty_quantity = GREATEST(COALESCE(system_empty_quantity, 0) - ?, 0),
           updated_at = NOW()
       WHERE id = ?
       `,
-      [deductQty, row.id]
+      [deductQty, deductQty, row.id]
     );
 
     remaining -= deductQty;
@@ -165,20 +166,21 @@ const restoreEmptyStock = async (connection, productId, qty, agencyId) => {
       `
       UPDATE stock
       SET empty_quantity = COALESCE(empty_quantity, 0) + ?,
+          system_empty_quantity = COALESCE(system_empty_quantity, 0) + ?,
           updated_at = NOW()
       WHERE id = ?
       `,
-      [quantity, rows[0].id]
+      [quantity, quantity, rows[0].id]
     );
     return;
   }
 
   await connection.execute(
     `
-    INSERT INTO stock (product_id, stock_area_id, quantity, empty_quantity, defective_quantity, agency_id)
-    VALUES (?, NULL, 0, ?, 0, ?)
+    INSERT INTO stock (product_id, stock_area_id, quantity, empty_quantity, system_empty_quantity, defective_quantity, agency_id)
+    VALUES (?, NULL, 0, ?, ?, 0, ?)
     `,
-    [Number(productId), quantity, agencyId]
+    [Number(productId), quantity, quantity, agencyId]
   );
 };
 

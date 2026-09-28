@@ -225,6 +225,30 @@ export const getOwnerDashboard = async (req, res) => {
       [req.user.agency_id, startDate, endDate]
     );
 
+    // Cylinders sold whose OTP is still PENDING (Domestic and Commercial)
+    const [pendingOtpRows] = await db.execute(
+      `
+      SELECT
+        p.type AS product_type,
+        COALESCE(SUM(COALESCE(si.delivered_qty, si.quantity, 0)), 0) AS pending_otp
+      FROM sales_items si
+      INNER JOIN sales s ON s.id = si.sale_id
+      INNER JOIN products p ON p.id = si.product_id
+      WHERE si.allocation_sales_item_id IS NOT NULL
+        AND s.status = 'DELIVERED'
+        AND s.agency_id = ?
+        AND p.type IN ('DOMESTIC', 'COMMERCIAL')
+        AND EXISTS (
+          SELECT 1 FROM driver_sale_otps dso
+          WHERE dso.sale_id = s.id
+            AND dso.status = 'PENDING'
+            AND DATE(dso.created_at) BETWEEN ? AND ?
+        )
+      GROUP BY p.type
+      `,
+      [req.user.agency_id, startDate, endDate]
+    );
+
     let domesticStock = 0;
     let commercialStock = 0;
     let emptyDomestic = 0;
@@ -233,6 +257,7 @@ export const getOwnerDashboard = async (req, res) => {
     let allocatedCommercial = 0;
     let otpSentDomestic = 0;
     let otpSentCommercial = 0;
+    let pendingOtpDomestic = 0;
 
     stockRows.forEach((row) => {
       if (row.product_type === "DOMESTIC") {
@@ -260,13 +285,23 @@ export const getOwnerDashboard = async (req, res) => {
       }
     });
 
+    let pendingOtpCommercial = 0;
+
+    pendingOtpRows.forEach((row) => {
+      if (row.product_type === "DOMESTIC") {
+        pendingOtpDomestic = Number(row.pending_otp || 0);
+      } else if (row.product_type === "COMMERCIAL") {
+        pendingOtpCommercial = Number(row.pending_otp || 0);
+      }
+    });
+
     // Physical = godown on-hand + cylinders in-hand with drivers (same as godown stock-detail)
     const physicalDomestic = domesticStock + allocatedDomestic;
     const physicalCommercial = commercialStock + allocatedCommercial;
 
-    // System = physical + cylinders sold with OTP still pending (same as godown stock-detail)
-    const systemDomestic = physicalDomestic + otpSentDomestic;
-    const systemCommercial = physicalCommercial + otpSentCommercial;
+    // Both Commercial and Domestic: system stock equals physical stock plus sales pending OTP confirmation
+    const systemCommercial = physicalCommercial + pendingOtpCommercial;
+    const systemDomestic = physicalDomestic + pendingOtpDomestic;
 
     const totalGodownStock = domesticStock + commercialStock;
     const totalPhysical = physicalDomestic + physicalCommercial;
