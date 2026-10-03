@@ -148,6 +148,10 @@ export const getStockDashboard = async (req, res) => {
         COALESCE(stk.system_opening, 0) AS system_opening,
         COALESCE(stk.saved_closing_stock, 0) AS saved_closing_stock,
         COALESCE(stk.saved_system_closing, 0) AS saved_system_closing,
+        COALESCE(stk.empty_opening, 0) AS empty_opening,
+        COALESCE(stk.system_empty_opening, 0) AS system_empty_opening,
+        COALESCE(stk.saved_empty_closing, 0) AS saved_empty_closing,
+        COALESCE(stk.saved_system_empty_closing, 0) AS saved_system_empty_closing,
         COALESCE(stk.is_finalized, 0) AS is_finalized,
 
         COALESCE(sa.sales, 0) AS sales,
@@ -156,6 +160,10 @@ export const getStockDashboard = async (req, res) => {
         COALESCE(pur.purchase, 0) AS purchase,
         COALESCE(pr.purchaseReturn, 0) AS purchaseReturn,
         COALESCE(def.defective, 0) AS defective,
+        COALESCE(stk_live.emptyQty, 0) AS liveEmptyQty,
+        COALESCE(stk_live.systemEmptyQty, 0) AS liveSystemEmptyQty,
+        COALESCE(empties.collected, 0) AS collectedEmpties,
+        COALESCE(ret.returned, 0) AS returnedEmpties,
         (
           COALESCE(stk_live.emptyQty, 0) +
           GREATEST(COALESCE(empties.collected, 0) - COALESCE(ret.returned, 0), 0)
@@ -172,6 +180,10 @@ export const getStockDashboard = async (req, res) => {
           COALESCE(SUM(dss.system_opening), 0) AS system_opening,
           COALESCE(SUM(dss.closing_stock), 0) AS saved_closing_stock,
           COALESCE(SUM(dss.system_closing), 0) AS saved_system_closing,
+          COALESCE(SUM(dss.empty_opening), 0) AS empty_opening,
+          COALESCE(SUM(dss.system_empty_opening), 0) AS system_empty_opening,
+          COALESCE(SUM(dss.empty_closing), 0) AS saved_empty_closing,
+          COALESCE(SUM(dss.system_empty_closing), 0) AS saved_system_empty_closing,
           MIN(dss.is_finalized) AS is_finalized
         FROM daily_stock_snapshots dss
         WHERE dss.snapshot_date = ?
@@ -445,6 +457,14 @@ export const getStockDashboard = async (req, res) => {
         const pSysOpening = Number(row.system_opening != null ? row.system_opening : row.systemStock || 0);
         const pSysClosing = pSysOpening + pPurchase - pSysSales;
 
+        const pLiveEmptyQty = Number(row.liveEmptyQty != null ? row.liveEmptyQty : row.emptyQty || 0);
+        const pCollectedEmpties = Number(row.collectedEmpties || 0);
+        const pReturnedEmpties = Number(row.returnedEmpties || 0);
+        const pEmptyPhysical = pLiveEmptyQty + Math.max(pCollectedEmpties - pReturnedEmpties, 0);
+
+        const pLiveSystemEmptyQty = Number(row.liveSystemEmptyQty != null ? row.liveSystemEmptyQty : row.systemEmptyQty || 0);
+        const pEmptyStock = pLiveSystemEmptyQty > 0 ? pLiveSystemEmptyQty : (pCollectedEmpties > 0 ? pCollectedEmpties : 0);
+
         if (stockAreaId) {
           await connection.query(
             `
@@ -457,6 +477,8 @@ export const getStockDashboard = async (req, res) => {
                 defective_qty = ?,
                 closing_stock = ?,
                 system_closing = ?,
+                empty_closing = ?,
+                system_empty_closing = ?,
                 updated_at = NOW()
             WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE()
             `,
@@ -469,6 +491,8 @@ export const getStockDashboard = async (req, res) => {
               pDefective,
               pClosing,
               pSysClosing,
+              pEmptyPhysical,
+              pEmptyStock,
               req.user.agency_id,
               stockAreaId,
               row.product_id,
@@ -496,6 +520,8 @@ export const getStockDashboard = async (req, res) => {
                   defective_qty = ?,
                   closing_stock = ?,
                   system_closing = ?,
+                  empty_closing = ?,
+                  system_empty_closing = ?,
                   updated_at = NOW()
               WHERE id = ?
               `,
@@ -508,6 +534,8 @@ export const getStockDashboard = async (req, res) => {
                 pDefective,
                 snapClosing,
                 snapSysClosing,
+                pEmptyPhysical,
+                pEmptyStock,
                 ps.id,
               ]
             );
@@ -541,10 +569,26 @@ export const getStockDashboard = async (req, res) => {
         // System Closing = System Opening + Purchase - System Sales (Domestic & Commercial OTP confirmed)
         let systemClosing = systemOpening + purchase - systemSales;
 
+        // Empty physical: godown approved empty stock + in-transit empties collected by drivers
+        const liveEmptyQty = Number(row.liveEmptyQty != null ? row.liveEmptyQty : row.emptyQty || 0);
+        const collectedEmpties = Number(row.collectedEmpties || 0);
+        const returnedEmpties = Number(row.returnedEmpties || 0);
+        let emptyPhysical = liveEmptyQty + Math.max(collectedEmpties - returnedEmpties, 0);
+
+        // Empty system stock: tracked system_empty_quantity, fallback to collected/confirmed empties
+        const liveSystemEmptyQty = Number(row.liveSystemEmptyQty != null ? row.liveSystemEmptyQty : row.systemEmptyQty || 0);
+        let emptyStock = liveSystemEmptyQty > 0 ? liveSystemEmptyQty : (collectedEmpties > 0 ? collectedEmpties : 0);
+
         // If the requested date is in the past and is_finalized = 1, read the saved closing_stock directly:
         if (startDate < today && Number(row.is_finalized) === 1 && startDate === endDate) {
           physicalClosing = Number(row.saved_closing_stock || 0);
           systemClosing = Number(row.saved_system_closing || 0);
+          if (row.saved_empty_closing != null && Number(row.saved_empty_closing) > 0) {
+            emptyPhysical = Number(row.saved_empty_closing);
+          }
+          if (row.saved_system_empty_closing != null && Number(row.saved_system_empty_closing) > 0) {
+            emptyStock = Number(row.saved_system_empty_closing);
+          }
         }
 
         const systemStock = systemClosing;
@@ -566,6 +610,10 @@ export const getStockDashboard = async (req, res) => {
           purchaseReturn,
           defective,
           emptyCylinders,
+          emptyPhysical,
+          emptyStock,
+          systemEmptyStock: emptyStock,
+          emptyClosing: emptyPhysical,
           systemStock,
           // Closing Stock = Opening Stock + Purchase Stock - Sales
           closingStock: physicalClosing,
