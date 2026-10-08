@@ -1445,7 +1445,20 @@ export const updateOwnerStockProduct = async (req, res) => {
 
   try {
     const productId = Number(req.params.productId || req.params.id || 0);
-    const { name, type, price, categoryName, openingStock, systemStock } = req.body;
+    const {
+      name,
+      type,
+      price,
+      categoryName,
+      openingStock,
+      systemStock,
+      emptyPhysical,
+      emptyQuantity,
+      emptyOpeningStock,
+      emptyStock,
+      systemEmptyStock,
+      systemEmptyQuantity,
+    } = req.body;
 
     if (!productId) {
       return res.status(400).json({
@@ -1463,6 +1476,32 @@ export const updateOwnerStockProduct = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Product not found",
+      });
+    }
+
+    const rawEmptyPhysical = emptyPhysical ?? emptyQuantity ?? emptyOpeningStock;
+    const newEmptyPhysical =
+      rawEmptyPhysical !== undefined && rawEmptyPhysical !== null && rawEmptyPhysical !== ""
+        ? Number(rawEmptyPhysical)
+        : null;
+
+    const rawSystemEmpty = systemEmptyStock ?? systemEmptyQuantity ?? emptyStock;
+    const newSystemEmpty =
+      rawSystemEmpty !== undefined && rawSystemEmpty !== null && rawSystemEmpty !== ""
+        ? Number(rawSystemEmpty)
+        : null;
+
+    if (newEmptyPhysical !== null && (!Number.isFinite(newEmptyPhysical) || newEmptyPhysical < 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Empty physical quantity must be a non-negative number",
+      });
+    }
+
+    if (newSystemEmpty !== null && (!Number.isFinite(newSystemEmpty) || newSystemEmpty < 0)) {
+      return res.status(400).json({
+        success: false,
+        message: "Empty system stock must be a non-negative number",
       });
     }
 
@@ -1497,7 +1536,18 @@ export const updateOwnerStockProduct = async (req, res) => {
       [updatedName, updatedType, updatedPrice, categoryId, productId]
     );
 
-    if (openingStock !== undefined || systemStock !== undefined) {
+    const hasStockUpdate =
+      openingStock !== undefined ||
+      systemStock !== undefined ||
+      rawEmptyPhysical !== undefined ||
+      rawSystemEmpty !== undefined;
+
+    let targetQuantity = null;
+    let targetSystemQuantity = null;
+    let targetEmptyQuantity = null;
+    let targetSystemEmptyQuantity = null;
+
+    if (hasStockUpdate) {
       const [[stockArea]] = await connection.query(
         `SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1`,
         [req.user.agency_id]
@@ -1514,38 +1564,45 @@ export const updateOwnerStockProduct = async (req, res) => {
       // Ensure today's snapshot exists
       await ensureDailyStockSnapshot(connection, req.user.agency_id, null, stockAreaId);
 
-      if (newOpening !== null && newSystem !== null) {
-        await connection.query(
-          `
-          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
-          VALUES (?, ?, ?, ?, 0, 0, 0, ?)
-          ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), system_quantity = VALUES(system_quantity), updated_at = CURRENT_TIMESTAMP
-          `,
-          [productId, stockAreaId, Math.floor(newOpening), Math.floor(newSystem), req.user.agency_id]
-        );
-      } else if (newOpening !== null) {
-        await connection.query(
-          `
-          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
-          VALUES (?, ?, ?, 0, 0, 0, 0, ?)
-          ON DUPLICATE KEY UPDATE quantity = VALUES(quantity), updated_at = CURRENT_TIMESTAMP
-          `,
-          [productId, stockAreaId, Math.floor(newOpening), req.user.agency_id]
-        );
-      } else if (newSystem !== null) {
-        await connection.query(
-          `
-          INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, quantity_return, empty_quantity, defective_quantity, agency_id)
-          VALUES (?, ?, 0, ?, 0, 0, 0, ?)
-          ON DUPLICATE KEY UPDATE system_quantity = VALUES(system_quantity), updated_at = CURRENT_TIMESTAMP
-          `,
-          [productId, stockAreaId, Math.floor(newSystem), req.user.agency_id]
-        );
-      }
+      const [[existingStock]] = await connection.query(
+        `SELECT quantity, system_quantity, empty_quantity, system_empty_quantity FROM stock WHERE product_id = ? AND stock_area_id = ? AND agency_id = ? LIMIT 1`,
+        [productId, stockAreaId, req.user.agency_id]
+      );
+
+      targetQuantity = newOpening !== null ? Math.floor(newOpening) : Number(existingStock?.quantity || 0);
+      targetSystemQuantity = newSystem !== null ? Math.floor(newSystem) : Number(existingStock?.system_quantity || 0);
+      targetEmptyQuantity = newEmptyPhysical !== null ? Math.floor(newEmptyPhysical) : Number(existingStock?.empty_quantity || 0);
+      targetSystemEmptyQuantity = newSystemEmpty !== null ? Math.floor(newSystemEmpty) : Number(existingStock?.system_empty_quantity || 0);
+
+      await connection.query(
+        `
+        INSERT INTO stock (
+          product_id, stock_area_id, quantity, system_quantity, 
+          quantity_return, empty_quantity, system_empty_quantity, 
+          defective_quantity, agency_id
+        )
+        VALUES (?, ?, ?, ?, 0, ?, ?, 0, ?)
+        ON DUPLICATE KEY UPDATE 
+          quantity = VALUES(quantity), 
+          system_quantity = VALUES(system_quantity), 
+          empty_quantity = VALUES(empty_quantity), 
+          system_empty_quantity = VALUES(system_empty_quantity), 
+          updated_at = CURRENT_TIMESTAMP
+        `,
+        [
+          productId,
+          stockAreaId,
+          targetQuantity,
+          targetSystemQuantity,
+          targetEmptyQuantity,
+          targetSystemEmptyQuantity,
+          req.user.agency_id,
+        ]
+      );
 
       // Update today's daily_stock_snapshots for snapshot_date = CURDATE()
       const [todaySnapshots] = await connection.query(
-        `SELECT id, opening_stock, system_opening, purchase_qty, sales_qty, system_sales_qty FROM daily_stock_snapshots WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE() FOR UPDATE`,
+        `SELECT id, opening_stock, system_opening, empty_opening, system_empty_opening, empty_closing, system_empty_closing, purchase_qty, sales_qty, system_sales_qty FROM daily_stock_snapshots WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE() FOR UPDATE`,
         [req.user.agency_id, stockAreaId, productId]
       );
 
@@ -1559,6 +1616,11 @@ export const updateOwnerStockProduct = async (req, res) => {
         const newClosing = updatedOpening + purchaseQty - salesQty;
         const newSystemClosing = updatedSystemOpening + purchaseQty - systemSalesQty;
 
+        const updatedEmptyOpening = newEmptyPhysical !== null ? Math.floor(newEmptyPhysical) : Number(snap.empty_opening || 0);
+        const updatedSystemEmptyOpening = newSystemEmpty !== null ? Math.floor(newSystemEmpty) : Number(snap.system_empty_opening || 0);
+        const updatedEmptyClosing = newEmptyPhysical !== null ? targetEmptyQuantity : Number(snap.empty_closing != null ? snap.empty_closing : targetEmptyQuantity);
+        const updatedSystemEmptyClosing = newSystemEmpty !== null ? targetSystemEmptyQuantity : Number(snap.system_empty_closing != null ? snap.system_empty_closing : targetSystemEmptyQuantity);
+
         await connection.query(
           `
           UPDATE daily_stock_snapshots
@@ -1566,10 +1628,24 @@ export const updateOwnerStockProduct = async (req, res) => {
               closing_stock = ?,
               system_opening = ?,
               system_closing = ?,
+              empty_opening = ?,
+              empty_closing = ?,
+              system_empty_opening = ?,
+              system_empty_closing = ?,
               updated_at = NOW()
           WHERE id = ?
           `,
-          [updatedOpening, newClosing, updatedSystemOpening, newSystemClosing, snap.id]
+          [
+            updatedOpening,
+            newClosing,
+            updatedSystemOpening,
+            newSystemClosing,
+            updatedEmptyOpening,
+            updatedEmptyClosing,
+            updatedSystemEmptyOpening,
+            updatedSystemEmptyClosing,
+            snap.id,
+          ]
         );
       }
     }
@@ -1585,6 +1661,12 @@ export const updateOwnerStockProduct = async (req, res) => {
         type: updatedType,
         price: updatedPrice,
         categoryId,
+        ...(hasStockUpdate && {
+          openingStock: targetQuantity,
+          systemStock: targetSystemQuantity,
+          emptyPhysical: targetEmptyQuantity,
+          systemEmptyStock: targetSystemEmptyQuantity,
+        }),
       },
     });
   } catch (error) {
