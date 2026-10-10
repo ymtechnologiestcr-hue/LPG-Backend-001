@@ -63,18 +63,31 @@ const getUserByIdentifier = async (identifier) => {
   if (!value) return null;
 
   let query = `
-    SELECT id, name, email, phone, password, role, status, agency_id
-    FROM users
-    WHERE LOWER(email) = LOWER(?)
+    SELECT u.id, u.name, u.email, u.phone, u.password,
+           COALESCE(
+             CASE 
+               WHEN ujp.display_role = 'GODOWN_MANAGER' THEN 'GODOWN_MANAGER'
+               WHEN ujp.display_role IN ('PURCHASE_DRIVER', 'PURCHASE_MANAGER') THEN 'PURCHASE_MANAGER'
+               WHEN ujp.display_role IN ('DELIVERY_AGENT', 'DRIVER') THEN 'DRIVER'
+               WHEN ujp.display_role = 'CASHIER' THEN 'CASHIER'
+               WHEN ujp.display_role = 'CUSTOMER_SERVICE' THEN 'SUPPORT'
+               ELSE NULL
+             END,
+             u.role
+           ) AS role,
+           u.status, u.agency_id
+    FROM users u
+    LEFT JOIN user_job_profiles ujp ON u.id = ujp.user_id
+    WHERE LOWER(u.email) = LOWER(?)
   `;
   let params = [value];
 
   if (digits) {
     const lastTenDigits = digits.length >= 10 ? digits.slice(-10) : digits;
     query += `
-      OR phone = ?
-      OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', '') = ?
-      OR RIGHT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', ''), 10) = ?
+      OR u.phone = ?
+      OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', '') = ?
+      OR RIGHT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', ''), 10) = ?
     `;
     params.push(value, digits, lastTenDigits);
   }

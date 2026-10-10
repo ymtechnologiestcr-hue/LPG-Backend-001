@@ -266,8 +266,8 @@ export const createCustomerTransfer = async (req, res) => {
     const agencyId = req.user.agency_id;
 
     const [existingCustomerRows] = await connection.query(
-      "SELECT id, name FROM users WHERE id = ? AND role = 'CUSTOMER' AND agency_id = ? LIMIT 1",
-      [Number(existingCustomerId), agencyId]
+      "SELECT id, name, agency_id FROM users WHERE id = ? AND role = 'CUSTOMER' LIMIT 1",
+      [Number(existingCustomerId)]
     );
 
     if (!existingCustomerRows.length) {

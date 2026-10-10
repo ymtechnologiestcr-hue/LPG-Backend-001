@@ -147,6 +147,23 @@ export const listIocOtps = async (req, res) => {
         s.driver_id,
         du.name AS driver_name,
         (
+          SELECT COALESCE(GROUP_CONCAT(DISTINCT pr.name SEPARATOR ', '), '14.2 KG Domestic')
+          FROM sales_items si
+          INNER JOIN products pr ON pr.id = si.product_id
+          WHERE si.sale_id = dso.sale_id
+        ) AS item_name,
+        (
+          SELECT COALESCE(SUM(si.quantity), 1)
+          FROM sales_items si
+          WHERE si.sale_id = dso.sale_id
+        ) AS quantity,
+        CASE
+          WHEN s.payment_method = 'ONLINE' THEN 'Direct'
+          WHEN EXISTS (SELECT 1 FROM payments pm WHERE pm.sale_id = s.id AND pm.type = 'COMPANY') THEN 'Direct'
+          WHEN s.payment_method = 'UPI' AND NOT EXISTS (SELECT 1 FROM payments pm WHERE pm.sale_id = s.id AND pm.type = 'DRIVER') THEN 'Direct'
+          ELSE 'Indirect'
+        END AS settlement,
+        (
           SELECT COALESCE(
             CASE
               WHEN COUNT(DISTINCT pr.type) > 1 THEN 'Mixed'

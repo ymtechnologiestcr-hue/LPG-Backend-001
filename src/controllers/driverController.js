@@ -1839,7 +1839,7 @@ export const createDriverReturn = async (req, res) => {
 
     if (phone && String(phone).trim() !== "") {
       [existingCustomers] = await connection.execute(
-        `SELECT id FROM users WHERE phone = ? LIMIT 1`,
+        `SELECT id FROM users WHERE phone = ? AND role = 'CUSTOMER' LIMIT 1`,
         [phone],
       );
     }
@@ -1848,7 +1848,7 @@ export const createDriverReturn = async (req, res) => {
       customerId = existingCustomers[0].id;
 
       await connection.execute(
-        `UPDATE users SET name = ?, role = 'CUSTOMER' WHERE id = ?`,
+        `UPDATE users SET name = ? WHERE id = ? AND role = 'CUSTOMER'`,
         [customer_name, customerId],
       );
     } else {

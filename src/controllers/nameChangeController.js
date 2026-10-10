@@ -65,11 +65,38 @@ export const lookupNameChangeCustomer = async (req, res) => {
   }
 };
 
+const ensureNameChangeAddressColumns = async (connection) => {
+  const [cols] = await connection.query(`
+    SELECT COLUMN_NAME
+    FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'customer_name_change_requests'
+      AND COLUMN_NAME IN ('address', 'is_same_address')
+  `);
+  const existingCols = new Set(cols.map((r) => String(r.COLUMN_NAME)));
+
+  if (!existingCols.has("address")) {
+    try {
+      await connection.query(
+        "ALTER TABLE customer_name_change_requests ADD COLUMN address VARCHAR(500) DEFAULT NULL AFTER document_url"
+      );
+    } catch (_e) {}
+  }
+
+  if (!existingCols.has("is_same_address")) {
+    try {
+      await connection.query(
+        "ALTER TABLE customer_name_change_requests ADD COLUMN is_same_address TINYINT(1) NOT NULL DEFAULT 1 AFTER address"
+      );
+    } catch (_e) {}
+  }
+};
+
 export const createNameChangeRequest = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
-    const { customerId, newName, serviceFee, documentUrl } = req.body || {};
+    const { customerId, newName, serviceFee, documentUrl, address, isSameAddress } = req.body || {};
 
     if (!customerId) {
       return res.status(400).json({
@@ -85,7 +112,7 @@ export const createNameChangeRequest = async (req, res) => {
       });
     }
 
-    const amount = Number(serviceFee);
+    const amount = Number(serviceFee || 0);
     if (!Number.isFinite(amount) || amount < 0) {
       return res.status(400).json({
         success: false,
@@ -96,8 +123,8 @@ export const createNameChangeRequest = async (req, res) => {
     const agencyId = req.user.agency_id;
 
     const [customerRows] = await connection.query(
-      "SELECT id, name FROM users WHERE id = ? AND role = 'CUSTOMER' AND agency_id = ? LIMIT 1",
-      [Number(customerId), agencyId]
+      "SELECT id, name, agency_id FROM users WHERE id = ? AND role = 'CUSTOMER' LIMIT 1",
+      [Number(customerId)]
     );
 
     if (!customerRows.length) {
@@ -119,6 +146,11 @@ export const createNameChangeRequest = async (req, res) => {
       });
     }
 
+    await ensureNameChangeAddressColumns(connection);
+
+    const isSame = isSameAddress === false || isSameAddress === 0 || isSameAddress === "false" ? 0 : 1;
+    const finalAddress = isSame ? null : String(address || "").trim() || null;
+
     const [result] = await connection.query(
       `
       INSERT INTO customer_name_change_requests (
@@ -127,9 +159,11 @@ export const createNameChangeRequest = async (req, res) => {
         new_name_requested,
         service_fee,
         document_url,
+        address,
+        is_same_address,
         status,
         agency_id
-      ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
       `,
       [
         Number(customerId),
@@ -137,7 +171,9 @@ export const createNameChangeRequest = async (req, res) => {
         String(newName).trim(),
         Number(amount.toFixed(2)),
         String(documentUrl || "").trim() || null,
-        agencyId,
+        finalAddress,
+        isSame,
+        customerRows[0].agency_id || agencyId,
       ]
     );
 

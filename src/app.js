@@ -28,6 +28,7 @@ import iocOtpRoutes from "./routes/iocOtpRoutes.js";
 import emptyCylinderLoadRoutes from "./routes/emptyCylinderLoadRoutes.js";
 import razorpayRoutes from "./routes/razorpayRoutes.js";
 import manualPaymentRoutes from "./routes/manualPaymentRoutes.js";
+import reportsRoutes from "./routes/reportsRoutes.js";
 
 const app = express();
 
@@ -100,6 +101,7 @@ app.use("/api/customer-transfers", customerTransferRoutes);
 app.use("/api/name-changes", nameChangeRoutes);
 app.use("/api/ioc-otps", iocOtpRoutes);
 app.use("/api/empty-cylinder-loads", emptyCylinderLoadRoutes);
+app.use("/api/reports", reportsRoutes);
 app.use("/api", razorpayRoutes);
 app.use("/api", manualPaymentRoutes);
 

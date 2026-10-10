@@ -5,26 +5,23 @@
 
 export const findCustomerForLookup = async (
   connection,
-  { identifier = "", name = "", agencyId = null } = {}
+  { identifier = "", consumerNumber = "", phone = "", name = "", customerName = "", agencyId = null } = {}
 ) => {
-  const term = String(identifier || "").trim();
-  const customerName = String(name || "").trim();
+  const term = String(identifier || consumerNumber || phone || "").trim();
+  const customerNameQuery = String(name || customerName || "").trim();
 
-  if (!term && !customerName) {
+  if (!term && !customerNameQuery) {
     return null;
   }
 
   const conditions = ["u.role = 'CUSTOMER'"];
   const params = [];
 
-  if (agencyId) {
-    conditions.push("u.agency_id = ?");
-    params.push(agencyId);
-  }
-
+  // Match term with various normalizations
   if (term) {
     const cleanDigits = term.replace(/\D/g, "");
     const last10Digits = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : "";
+    const strippedTerm = term.replace(/[\s\-_.]/g, "");
     const digitNum =
       cleanDigits.length > 0 && cleanDigits.length <= 10
         ? Number.parseInt(cleanDigits, 10)
@@ -39,8 +36,29 @@ export const findCustomerForLookup = async (
       "u.consumer_number LIKE CONCAT('%', ?, '%')",
       "u.phone LIKE CONCAT('%', ?, '%')",
       "u.consumer_id LIKE CONCAT('%', ?, '%')",
+      "REPLACE(REPLACE(REPLACE(COALESCE(u.consumer_number, ''), '-', ''), ' ', ''), '.', '') = ?",
+      "REPLACE(REPLACE(REPLACE(COALESCE(u.consumer_id, ''), '-', ''), ' ', ''), '.', '') = ?",
     ];
-    params.push(term, term, term, term, term, term, term, term);
+    params.push(
+      term,
+      term,
+      term,
+      term,
+      term,
+      term,
+      term,
+      term,
+      strippedTerm,
+      strippedTerm
+    );
+
+    if (cleanDigits && cleanDigits !== term && cleanDigits !== strippedTerm) {
+      termConditions.push(
+        "REPLACE(REPLACE(REPLACE(COALESCE(u.consumer_id, ''), '-', ''), ' ', ''), '.', '') LIKE CONCAT('%', ?, '%')",
+        "u.consumer_number LIKE CONCAT('%', ?, '%')"
+      );
+      params.push(cleanDigits, cleanDigits);
+    }
 
     if (last10Digits && last10Digits !== term) {
       termConditions.push(
@@ -52,7 +70,7 @@ export const findCustomerForLookup = async (
       params.push(last10Digits, last10Digits, last10Digits, last10Digits);
     }
 
-    if (digitNum) {
+    if (digitNum && digitNum < 2147483647) {
       termConditions.push("u.id = ?");
       params.push(digitNum);
     }
@@ -60,17 +78,27 @@ export const findCustomerForLookup = async (
     conditions.push(`(${termConditions.join(" OR ")})`);
   }
 
-  if (customerName) {
+  if (customerNameQuery) {
     conditions.push("u.name LIKE ?");
-    params.push(`%${customerName}%`);
+    params.push(`%${customerNameQuery}%`);
   }
 
-  let orderClause = "ORDER BY u.id DESC";
+  // If agencyId is provided, prioritize it first rather than strictly filtering out
+  // in case the agency ID in token is slightly different or customer spans agency.
+  let agencyOrder = "";
+  if (agencyId) {
+    agencyOrder = "CASE WHEN u.agency_id = ? THEN 0 ELSE 1 END,";
+  }
+
+  let orderClause = "ORDER BY " + (agencyId ? "CASE WHEN u.agency_id = ? THEN 0 ELSE 1 END, " : "") + "u.id DESC";
+  const orderParams = agencyId ? [agencyId] : [];
+
   if (term) {
     const cleanDigits = term.replace(/\D/g, "");
     const last10Digits = cleanDigits.length >= 10 ? cleanDigits.slice(-10) : "";
 
     orderClause = `ORDER BY
+      ${agencyId ? "CASE WHEN u.agency_id = ? THEN 0 ELSE 1 END," : ""}
       CASE
         WHEN u.consumer_number = ? THEN 1
         WHEN u.phone = ? THEN 2
@@ -85,12 +113,14 @@ export const findCustomerForLookup = async (
       END ASC,
       u.id DESC`;
 
-    const orderParams = [term, term];
+    if (agencyId) {
+      orderParams.push(agencyId);
+    }
+    orderParams.push(term, term);
     if (last10Digits) {
       orderParams.push(last10Digits, last10Digits);
     }
     orderParams.push(term, term, term, term, term, term);
-    params.push(...orderParams);
   }
 
   const [rows] = await connection.query(
@@ -101,14 +131,17 @@ export const findCustomerForLookup = async (
       u.phone,
       u.consumer_number AS consumer_number,
       u.consumer_id AS consumer_id,
-      COALESCE(a.address, '') AS address
+      u.agency_id,
+      COALESCE(
+        (SELECT a.address FROM addresses a WHERE a.user_id = u.id ORDER BY a.is_default DESC, a.id DESC LIMIT 1),
+        ''
+      ) AS address
     FROM users u
-    LEFT JOIN addresses a ON a.user_id = u.id AND a.is_default = 1
     WHERE ${conditions.join(" AND ")}
     ${orderClause}
     LIMIT 1
     `,
-    params
+    [...params, ...orderParams]
   );
 
   return rows[0] || null;
@@ -160,7 +193,7 @@ export const searchCustomersList = async (
       params.push(last10Digits, last10Digits);
     }
 
-    if (digitNum) {
+    if (digitNum && digitNum < 2147483647) {
       searchConditions.push("u.id = ?");
       params.push(digitNum);
     }
@@ -194,9 +227,11 @@ export const searchCustomersList = async (
       u.email,
       u.company_name,
       u.consumer_number AS consumer_number,
-      COALESCE(a.address, '') AS address
+      COALESCE(
+        (SELECT a.address FROM addresses a WHERE a.user_id = u.id ORDER BY a.is_default DESC, a.id DESC LIMIT 1),
+        ''
+      ) AS address
     FROM users u
-    LEFT JOIN addresses a ON a.user_id = u.id AND a.is_default = 1
     WHERE ${conditions.join(" AND ")}
     ${orderClause}
     LIMIT ?

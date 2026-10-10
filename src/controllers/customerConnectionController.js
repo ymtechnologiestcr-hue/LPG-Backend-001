@@ -160,38 +160,61 @@ export const createCustomerConnection = async (req, res) => {
 
     const agencyId = req.user.agency_id;
 
+    let finalConsumerNumber = String(req.body?.consumerNumber || "").trim();
+    if (!finalConsumerNumber) {
+      finalConsumerNumber = `LPG-${Math.floor(100000 + Math.random() * 900000)}`;
+    }
+    const finalConsumerId = String(req.body?.consumerId || finalConsumerNumber).trim();
+
     const [existingUserRows] = await connection.query(
-      "SELECT id FROM users WHERE phone = ? AND agency_id = ? LIMIT 1",
+      "SELECT id, consumer_number FROM users WHERE phone = ? AND agency_id = ? AND role = 'CUSTOMER' LIMIT 1",
       [String(mobileNumber).trim(), agencyId]
     );
-
-    if (existingUserRows.length) {
-      return res.status(409).json({
-        success: false,
-        message: "A user with this mobile number already exists",
-      });
-    }
 
     await connection.beginTransaction();
     await ensureNewConnectionProductTable(connection);
 
-    const [userResult] = await connection.query(
-      `
-      INSERT INTO users (name, phone, role, status, agency_id)
-      VALUES (?, ?, 'CUSTOMER', 'ACTIVE', ?)
-      `,
-      [String(customerName).trim(), String(mobileNumber).trim(), agencyId]
-    );
+    let userId = null;
+    if (existingUserRows.length) {
+      userId = Number(existingUserRows[0].id);
+      await connection.query(
+        `
+        UPDATE users
+        SET name = ?,
+            consumer_number = COALESCE(consumer_number, ?),
+            consumer_id = COALESCE(consumer_id, ?),
+            role = 'CUSTOMER',
+            status = 'ACTIVE'
+        WHERE id = ? AND role = 'CUSTOMER'
+        `,
+        [String(customerName).trim(), finalConsumerNumber, finalConsumerId, userId]
+      );
+    } else {
+      const [userResult] = await connection.query(
+        `
+        INSERT INTO users (name, phone, role, status, agency_id, consumer_number, consumer_id)
+        VALUES (?, ?, 'CUSTOMER', 'ACTIVE', ?, ?, ?)
+        `,
+        [String(customerName).trim(), String(mobileNumber).trim(), agencyId, finalConsumerNumber, finalConsumerId]
+      );
+      userId = Number(userResult.insertId);
+    }
 
-    const userId = Number(userResult.insertId);
-
-    await connection.query(
-      `
-      INSERT INTO addresses (user_id, address, is_default)
-      VALUES (?, ?, 1)
-      `,
-      [userId, String(address).trim()]
+    const [existingAddressRows] = await connection.query(
+      "SELECT id FROM addresses WHERE user_id = ? AND is_default = 1 LIMIT 1",
+      [userId]
     );
+    if (existingAddressRows.length) {
+      await connection.query(
+        "UPDATE addresses SET address = ? WHERE id = ?",
+        [String(address).trim(), existingAddressRows[0].id]
+      );
+    } else {
+      await connection.query(
+        "INSERT INTO addresses (user_id, address, is_default) VALUES (?, ?, 1)",
+        [userId, String(address).trim()]
+      );
+    }
 
     const [connectionResult] = await connection.query(
       `
