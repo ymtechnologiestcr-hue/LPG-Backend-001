@@ -2634,7 +2634,7 @@ export const getDriverCollectionHistory = async (req, res) => {
       SELECT DATE(sh.created_at) AS collection_date
       FROM settlement_history sh
       WHERE sh.driver_id = ?
-        AND sh.status = 'SETTLED'
+        AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
         AND DATE(sh.created_at) BETWEEN ? AND ?
       GROUP BY DATE(sh.created_at)
       ORDER BY collection_date DESC
@@ -2650,7 +2650,7 @@ export const getDriverCollectionHistory = async (req, res) => {
         SELECT DATE(sh.created_at) AS collection_date
         FROM settlement_history sh
         WHERE sh.driver_id = ?
-          AND sh.status = 'SETTLED'
+          AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
           AND DATE(sh.created_at) BETWEEN ? AND ?
         GROUP BY DATE(sh.created_at)
       ) t
@@ -2674,7 +2674,7 @@ export const getDriverCollectionHistory = async (req, res) => {
         FROM settlement_history sh
         LEFT JOIN sales s ON s.id = sh.sale_id
         WHERE sh.driver_id = ?
-          AND sh.status = 'SETTLED'
+          AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
           AND DATE(sh.created_at) = ?
         `,
         [numericDriverId, collectionDate],
@@ -2707,6 +2707,8 @@ export const getDriverCollectionHistory = async (req, res) => {
           sh.status AS settlement_history_status,
           sh.created_at,
           u.name AS customer_name,
+          COALESCE(u.phone, '') AS customer_phone,
+          COALESCE(u.consumer_number, '') AS consumer_number,
           COALESCE(SUM(CASE WHEN p.type = 'DOMESTIC' THEN si.quantity ELSE 0 END), 0) AS dom_qty,
           COALESCE(SUM(CASE WHEN p.type = 'COMMERCIAL' THEN si.quantity ELSE 0 END), 0) AS com_qty,
           COALESCE(SUM(CASE WHEN p.type != 'DOMESTIC' AND p.type != 'COMMERCIAL' THEN si.quantity ELSE 0 END), 0) AS items_qty
@@ -2716,13 +2718,116 @@ export const getDriverCollectionHistory = async (req, res) => {
         LEFT JOIN sales_items si ON s.id = si.sale_id
         LEFT JOIN products p ON si.product_id = p.id
         WHERE sh.driver_id = ?
-          AND sh.status IN ('SETTLED', 'PENDING')
+          AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
           AND DATE(sh.created_at) = ?
-        GROUP BY sh.id, sh.sale_id, sh.amount, sh.method, s.payment_method, sh.status, sh.created_at, u.name
+        GROUP BY sh.id, sh.sale_id, sh.amount, sh.method, s.payment_method, sh.status, sh.created_at, u.name, u.phone, u.consumer_number
         ORDER BY sh.created_at DESC, sh.id DESC
         `,
         [numericDriverId, collectionDate],
       );
+
+      // Query sales_items for each sale to obtain item name, quantity, rate, total amount
+      const saleIds = Array.from(new Set(transactionRows.map((r) => r.sale_id).filter(Boolean)));
+      const saleItemsMap = {};
+      if (saleIds.length > 0) {
+        try {
+          const placeholders = saleIds.map(() => "?").join(",");
+          const [saleItemRows] = await db.query(
+            `
+            SELECT
+              si.sale_id,
+              si.product_id,
+              COALESCE(p.name, 'LPG Cylinder') AS product_name,
+              COALESCE(p.type, 'DOMESTIC') AS product_type,
+              si.quantity,
+              COALESCE(si.price, p.price, 0) AS rate,
+              (si.quantity * COALESCE(si.price, p.price, 0)) AS item_total
+            FROM sales_items si
+            LEFT JOIN products p ON p.id = si.product_id
+            WHERE si.sale_id IN (${placeholders})
+            `,
+            saleIds,
+          );
+          for (const item of saleItemRows) {
+            if (!saleItemsMap[item.sale_id]) saleItemsMap[item.sale_id] = [];
+            saleItemsMap[item.sale_id].push({
+              productId: item.product_id,
+              productName: item.product_name,
+              productType: item.product_type,
+              quantity: Number(item.quantity || 0),
+              rate: Number(item.rate || 0),
+              totalAmount: Number(item.item_total || 0),
+            });
+          }
+        } catch (itemErr) {
+          console.warn("Could not fetch sales_items for collection breakdown:", itemErr);
+        }
+      }
+
+      // Aggregate consolidated item-wise breakdown for this collection
+      const itemMap = new Map();
+      for (const row of transactionRows) {
+        const itemsList = saleItemsMap[row.sale_id] || [];
+        if (itemsList.length > 0) {
+          for (const it of itemsList) {
+            const key = it.productName || "LPG Cylinder";
+            if (!itemMap.has(key)) {
+              itemMap.set(key, {
+                itemName: key,
+                productType: it.productType,
+                quantity: 0,
+                rate: it.rate,
+                totalAmount: 0,
+              });
+            }
+            const agg = itemMap.get(key);
+            agg.quantity += it.quantity;
+            agg.totalAmount += it.totalAmount;
+            if (it.rate > 0) agg.rate = it.rate;
+          }
+        } else {
+          if (row.dom_qty > 0) {
+            const key = "14.2kg Domestic Cylinder";
+            if (!itemMap.has(key)) {
+              itemMap.set(key, { itemName: key, productType: "DOMESTIC", quantity: 0, rate: 0, totalAmount: 0 });
+            }
+            itemMap.get(key).quantity += Number(row.dom_qty);
+          }
+          if (row.com_qty > 0) {
+            const key = "19kg Commercial Cylinder";
+            if (!itemMap.has(key)) {
+              itemMap.set(key, { itemName: key, productType: "COMMERCIAL", quantity: 0, rate: 0, totalAmount: 0 });
+            }
+            itemMap.get(key).quantity += Number(row.com_qty);
+          }
+        }
+      }
+      const itemWiseBreakdown = Array.from(itemMap.values());
+
+      const mappedTransactions = transactionRows.map((row) => {
+        const isOnline = ["UPI", "ONLINE", "CARD", "NET_BANKING"].includes(
+          String(row.payment_mode || "").toUpperCase()
+        );
+        const itemsList = saleItemsMap[row.sale_id] || [];
+        return {
+          saleId: Number(row.sale_id),
+          customerName: row.customer_name || "Unknown Customer",
+          customerPhone: row.customer_phone || "",
+          consumerNumber: row.consumer_number || "",
+          amount: Number(row.amount || 0),
+          paymentMode: row.payment_mode || "N/A",
+          isOnline,
+          domQty: Number(row.dom_qty || 0),
+          comQty: Number(row.com_qty || 0),
+          itemsQty: Number(row.items_qty || 0),
+          deliveredAt: row.created_at,
+          status: row.settlement_history_status || (cashierStatus === "SETTLED" ? "APPROVED" : "PENDING_APPROVAL"),
+          items: itemsList,
+        };
+      });
+
+      const cashTransactions = mappedTransactions.filter((t) => !t.isOnline);
+      const onlineTransactions = mappedTransactions.filter((t) => t.isOnline);
 
       const cashAmount = Number(summaryRows[0]?.cash_amount || 0);
       const upiAmount = Number(summaryRows[0]?.upi_amount || 0);
@@ -2737,25 +2842,20 @@ export const getDriverCollectionHistory = async (req, res) => {
           cash: {
             amount: cashAmount,
             status: cashAmount > 0 ? displayStatus : null,
+            count: cashTransactions.length,
             settledAt: null,
           },
           upi: {
             amount: upiAmount,
             status: upiAmount > 0 ? displayStatus : null,
+            count: onlineTransactions.length,
             settledAt: null,
           },
         },
-        transactions: transactionRows.map((row) => ({
-          saleId: Number(row.sale_id),
-          customerName: row.customer_name || "Unknown Customer",
-          amount: Number(row.amount || 0),
-          paymentMode: row.payment_mode || "N/A",
-          domQty: Number(row.dom_qty || 0),
-          comQty: Number(row.com_qty || 0),
-          itemsQty: Number(row.items_qty || 0),
-          deliveredAt: row.created_at,
-          status: displayStatus,
-        })),
+        itemWiseBreakdown,
+        transactions: mappedTransactions,
+        cashTransactions,
+        onlineTransactions,
       });
     }
 

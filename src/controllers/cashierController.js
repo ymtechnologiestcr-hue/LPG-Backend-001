@@ -942,13 +942,48 @@ export const getCashierDashboard = async (req, res) => {
     let onlineOut = 0;
     let bankOut = 0;
 
+    // Actual live cash currently physically held in the drawer (independent of date filter)
+    const actualAvailableCash = await getAvailableCashBalance(db, agencyId);
+
     if (!useRunningDay) {
-      // Historical date range view
-      openingBalance = 0;
+      // Historical date range view: reconcile opening cash at start of startDate
+      let rangeOpening = 0;
+      try {
+        const [startDayOpenings] = await db.query(
+          `SELECT opening_amount FROM cashier_openings WHERE agency_id = ? AND DATE(started_at) = ? ORDER BY id DESC LIMIT 1`,
+          [agencyId, startDate]
+        );
+        if (startDayOpenings && startDayOpenings.length) {
+          rangeOpening = Number(startDayOpenings[0].opening_amount || 0);
+        } else {
+          const [priorClosings] = await db.query(
+            `SELECT total_cash, petty_cash FROM cashier_closings WHERE agency_id = ? AND DATE(created_at) < ? ORDER BY id DESC LIMIT 1`,
+            [agencyId, startDate]
+          );
+          if (priorClosings && priorClosings.length) {
+            rangeOpening = Number(priorClosings[0].petty_cash || priorClosings[0].total_cash || 0);
+          } else {
+            const makeBeforeDateCond = (beforeDate) => (dateExpr) => ({
+              sql: `AND DATE(${dateExpr}) < ?`,
+              params: [beforeDate],
+            });
+            const priorLedger = await getCashLedger(db, makeBeforeDateCond(startDate), agencyId);
+            rangeOpening = Math.max(0, Number(priorLedger?.cashIn?.cash || 0) - Number(priorLedger?.cashOut?.cash || 0));
+          }
+        }
+      } catch (openErr) {
+        console.warn("Could not calculate range opening balance:", openErr);
+        rangeOpening = 0;
+      }
+
+      openingBalance = rangeOpening;
       totalCashIn = ledger.cashIn.cash;
       totalCashOut = ledger.cashOut.cash;
+      // Reconciled balance for period: Opening + In - Out
       currentBalance =
-        Number(ledger.cashIn.cash || 0) - Number(ledger.cashOut.cash || 0);
+        openingBalance +
+        Number(ledger.cashIn.cash || 0) -
+        Number(ledger.cashOut.cash || 0);
       onlineIn = ledger.cashIn.online;
       bankIn = ledger.cashIn.bank;
       onlineOut = ledger.cashOut.online;
@@ -981,17 +1016,21 @@ export const getCashierDashboard = async (req, res) => {
       bankOut = 0;
     }
 
+    const netRangeFlow = totalCashIn - totalCashOut;
+
     return res.status(200).json({
       success: true,
       lastClosingBalance: latestClosing?.pettyCash ?? 0,
       lastClosingTotal: latestClosing?.totalCash ?? 0,
       isDayOpen: dayIsOpen,
+      availableCash: actualAvailableCash,
+      actualAvailableCash: actualAvailableCash,
       metrics: [
         {
           title: "Opening Balance",
           value: `₹${Number(openingBalance).toLocaleString("en-IN")}`,
           description: !useRunningDay
-            ? "Filtered date range"
+            ? "Reconciled opening cash"
             : dayIsOpen
               ? "Today's opening cash"
               : latestClosing !== null
@@ -1032,15 +1071,16 @@ export const getCashierDashboard = async (req, res) => {
           },
         },
         {
-          title: "Current Balance",
+          title: !useRunningDay ? "Date Range Net Balance" : "Current Balance",
           value: `₹${currentBalance.toLocaleString("en-IN")}`,
           description: !useRunningDay
-            ? "Date range net balance"
+            ? `Net flow: ₹${netRangeFlow.toLocaleString("en-IN")}`
             : dayIsOpen
               ? "Live · last sync just now"
               : "In-office cash · Day closed",
           variant: currentBalance >= 0 ? "success" : "danger",
           icon: "💚",
+          availableCash: actualAvailableCash,
         },
       ],
       chart: {
@@ -4307,6 +4347,8 @@ export const getCashFlowEntriesByDate = async (req, res) => {
     const query = `
       SELECT 
         'DRIVER_SETTLEMENT' as type,
+        'Driver Collection' as expense_name,
+        'Driver Collection' as category,
         sh.id as reference_id,
         sh.amount,
         CASE 
@@ -4317,6 +4359,7 @@ export const getCashFlowEntriesByDate = async (req, res) => {
         'IN' as direction,
         COALESCE(sh.settled_at, sh.created_at) as timestamp,
         'Driver Collection Settlement' as description,
+        COALESCE(u.name, 'Driver') as payee,
         COALESCE(u.name, 'Driver') as source
       FROM settlement_history sh
       LEFT JOIN sales s ON s.id = sh.sale_id
@@ -4328,12 +4371,15 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'OFFICE_SALE' as type,
+        'Office Sale' as expense_name,
+        'Office Sale' as category,
         p.id as reference_id,
         p.amount,
         p.method as payment_mode,
         'IN' as direction,
         p.created_at as timestamp,
         'Office Sale Payment' as description,
+        COALESCE(cu.name, 'Customer') as payee,
         COALESCE(cu.name, 'Customer') as source
       FROM payments p
       INNER JOIN sales s ON s.id = p.sale_id
@@ -4344,12 +4390,15 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'PR_PENALTY' as type,
+        'PR Penalty' as expense_name,
+        'PR Penalty' as category,
         pr.id as reference_id,
         pr.penalty_amount as amount,
         pr.payment_mode,
         'IN' as direction,
         pr.paid_at as timestamp,
         'PR Penalty Collection' as description,
+        COALESCE(u.name, 'Customer') as payee,
         COALESCE(u.name, 'Customer') as source
       FROM customer_pr_penalties pr
       LEFT JOIN users u ON u.id = pr.customer_id
@@ -4359,12 +4408,15 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'NAME_CHANGE' as type,
+        'Name Change Fee' as expense_name,
+        'Name Change' as category,
         nc.id as reference_id,
         nc.service_fee as amount,
         nc.payment_mode,
         'IN' as direction,
         nc.approved_at as timestamp,
         'Name Change Request Fee' as description,
+        COALESCE(u.name, 'Customer') as payee,
         COALESCE(u.name, 'Customer') as source
       FROM customer_name_change_requests nc
       LEFT JOIN users u ON u.id = nc.customer_id
@@ -4374,12 +4426,15 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'NEW_CONNECTION' as type,
+        'New Connection Fee' as expense_name,
+        'New Connection' as category,
         cnc.id as reference_id,
         cnc.total_amount as amount,
         cnc.payment_mode,
         'IN' as direction,
         cnc.paid_at as timestamp,
         'New Connection Payment' as description,
+        COALESCE(u.name, 'Customer') as payee,
         COALESCE(u.name, 'Customer') as source
       FROM customer_new_connections cnc
       LEFT JOIN users u ON u.id = cnc.user_id
@@ -4389,12 +4444,15 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'CASHIER_RECEIPT' as type,
+        COALESCE(cr.receipt_type, 'Receipt') as expense_name,
+        COALESCE(cr.receipt_type, 'Receipt') as category,
         cr.id as reference_id,
         cr.amount,
         cr.payment_mode,
         'IN' as direction,
         cr.created_at as timestamp,
         COALESCE(cr.description, 'Cashier Other Receipt') as description,
+        COALESCE(cr.receipt_type, 'Receipt') as payee,
         COALESCE(cr.receipt_type, 'Receipt') as source
       FROM cashier_receipts cr
       WHERE DATE(cr.created_at) = ? AND cr.agency_id = ?
@@ -4403,13 +4461,16 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'DRIVER_PURCHASE_EXPENSE' as type,
+        COALESCE(e.category, 'Driver Expense') as expense_name,
+        COALESCE(e.category, 'Driver Expense') as category,
         e.id as reference_id,
         e.amount,
         ${ePaymentMode} as payment_mode,
         'OUT' as direction,
         e.created_at as timestamp,
-        e.description as description,
-        COALESCE(u.name, 'Staff') as source
+        COALESCE(e.description, e.category, 'Driver Expense') as description,
+        COALESCE(u.name, 'Driver') as payee,
+        COALESCE(u.name, 'Driver') as source
       FROM expenses e
       LEFT JOIN users u ON u.id = e.created_by
       WHERE e.status = 'APPROVED' AND DATE(e.created_at) = ? AND e.agency_id = ?
@@ -4418,26 +4479,33 @@ export const getCashFlowEntriesByDate = async (req, res) => {
 
       SELECT 
         'OFFICE_EXPENSE' as type,
+        COALESCE(oe.category, 'Office Expense') as expense_name,
+        COALESCE(oe.category, 'Office Expense') as category,
         oe.id as reference_id,
         oe.amount,
         ${oePaymentMode} as payment_mode,
         'OUT' as direction,
         COALESCE(oe.created_at, oe.updated_at) as timestamp,
-        oe.description as description,
+        COALESCE(oe.description, oe.category, 'Office Expense') as description,
+        COALESCE(u.name, 'Office Vendor') as payee,
         COALESCE(oe.category, 'Office Expense') as source
       FROM office_expenses oe
+      LEFT JOIN users u ON u.id = oe.admin_id
       WHERE DATE(COALESCE(oe.created_at, oe.updated_at)) = ? AND oe.agency_id = ? ${oeStatusFilter}
 
       UNION ALL
 
       SELECT 
         'TRANSFER_VOUCHER' as type,
+        'Deposit Refund' as expense_name,
+        'Transfer Voucher' as category,
         t.id as reference_id,
         t.deposit_liability as amount,
         t.payment_mode,
         'OUT' as direction,
         t.updated_at as timestamp,
         'Transfer Voucher Deposit Refund' as description,
+        COALESCE(u.name, 'Customer') as payee,
         COALESCE(u.name, 'Customer') as source
       FROM customer_connection_transfers t
       LEFT JOIN users u ON u.id = t.existing_customer_id
