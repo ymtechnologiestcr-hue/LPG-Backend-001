@@ -9,16 +9,18 @@ export const getUserSettings = async (req, res) => {
     const [rows] = await connection.query(
       `
       SELECT
-        id,
-        name,
-        company_name,
-        email,
-        phone,
-        role,
-        status,
-        created_at
-      FROM users
-      WHERE id = ? AND agency_id = ?
+        u.id,
+        u.name,
+        COALESCE(a.agency_name, u.company_name) AS agency_name,
+        u.company_name,
+        u.email,
+        u.phone,
+        u.role,
+        u.status,
+        u.created_at
+      FROM users u
+      LEFT JOIN agencies a ON u.agency_id = a.id
+      WHERE u.id = ? AND u.agency_id = ?
       LIMIT 1
       `,
       [userId, req.user.agency_id]

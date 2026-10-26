@@ -31,8 +31,24 @@ import {
   collectCashierNewConnectionRequest,
   getCashFlowEntriesByDate,
 } from "../controllers/cashierController.js";
+import {
+  getCashierDailySalesReport,
+  getCashierTotalCollectionReport,
+  getCashierExpensesReport,
+  getCashierConsolidatedCashReport,
+  getCashierClosingCashReport,
+  submitCashierClosingCashReport,
+} from "../controllers/cashierReportsController.js";
 
 const router = express.Router();
+
+// Cashier Reports endpoints
+router.get("/reports/daily-sales", getCashierDailySalesReport);
+router.get("/reports/total-collection", getCashierTotalCollectionReport);
+router.get("/reports/expenses", getCashierExpensesReport);
+router.get("/reports/consolidated-cash", getCashierConsolidatedCashReport);
+router.get("/reports/closing-cash", getCashierClosingCashReport);
+router.post("/reports/closing-cash", submitCashierClosingCashReport);
 
 router.get("/dashboard", getCashierDashboard);
 router.get("/driver-collections", getCashierDriverCollections);

@@ -39,6 +39,8 @@ const normalizeUser = (user, driverId = null) => ({
   id: Number(user.id),
   driver_id: driverId ? Number(driverId) : (user.driver_id ? Number(user.driver_id) : null),
   name: user.name || "",
+  company_name: user.company_name || null,
+  agency_name: user.agency_name || user.company_name || null,
   email: user.email || "",
   phone: user.phone || "",
   role: user.role,
@@ -63,7 +65,7 @@ const getUserByIdentifier = async (identifier) => {
   if (!value) return null;
 
   let query = `
-    SELECT u.id, u.name, u.email, u.phone, u.password,
+    SELECT u.id, u.name, u.company_name, u.email, u.phone, u.password,
            COALESCE(
              CASE 
                WHEN ujp.display_role = 'GODOWN_MANAGER' THEN 'GODOWN_MANAGER'
@@ -75,9 +77,11 @@ const getUserByIdentifier = async (identifier) => {
              END,
              u.role
            ) AS role,
-           u.status, u.agency_id
+           u.status, u.agency_id,
+           COALESCE(a.agency_name, u.company_name) AS agency_name
     FROM users u
     LEFT JOIN user_job_profiles ujp ON u.id = ujp.user_id
+    LEFT JOIN agencies a ON u.agency_id = a.id
     WHERE LOWER(u.email) = LOWER(?)
   `;
   let params = [value];
