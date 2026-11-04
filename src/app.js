@@ -29,8 +29,10 @@ import emptyCylinderLoadRoutes from "./routes/emptyCylinderLoadRoutes.js";
 import razorpayRoutes from "./routes/razorpayRoutes.js";
 import manualPaymentRoutes from "./routes/manualPaymentRoutes.js";
 import reportsRoutes from "./routes/reportsRoutes.js";
+import { ensureSchemaUpdated } from "./utils/schemaMigrations.js";
 
 const app = express();
+ensureSchemaUpdated().catch(console.warn);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
