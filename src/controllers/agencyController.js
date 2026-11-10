@@ -28,20 +28,33 @@ export const registerAgency = async (req, res) => {
     if (terms_accepted === "true") terms_accepted = true;
     if (terms_accepted === "false") terms_accepted = false;
 
-    // 1. Basic validation
-    if (
-      !agency_name ||
-      !gst_number ||
-      !phone_number ||
-      !email_id ||
-      !address ||
-      !state ||
-      !district ||
-      !pin_code
-    ) {
+    // 1. Validation for required fields & format
+    const invalidStatePlaceholders = [
+      "- select one -",
+      "-- select --",
+      "select one",
+      "select state",
+      "- select -",
+    ];
+    const isStateInvalid =
+      !state || invalidStatePlaceholders.includes(state.toLowerCase());
+
+    const errors = {};
+    if (!agency_name) errors.agency_name = "Agency name is required.";
+    if (!gst_number) errors.gst_number = "GST number is required.";
+    if (!phone_number) errors.phone_number = "Phone number is required.";
+    if (!email_id) errors.email_id = "Email address is required.";
+    if (!address) errors.address = "Address is required.";
+    if (isStateInvalid) errors.state = "Please provide a valid state.";
+    if (!district) errors.district = "District is required.";
+    if (!pin_code) errors.pin_code = "PIN code is required.";
+
+    if (Object.keys(errors).length > 0) {
+      const missingList = Object.keys(errors).join(", ");
       return res.status(400).json({
         success: false,
-        message: "Missing required fields.",
+        message: `Missing required fields: ${missingList}.`,
+        errors,
       });
     }
 
@@ -49,6 +62,7 @@ export const registerAgency = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "You must accept the Terms & Conditions.",
+        errors: { terms_accepted: "You must accept the Terms & Conditions." },
       });
     }
 
