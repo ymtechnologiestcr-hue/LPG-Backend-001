@@ -74,6 +74,14 @@ app.use((req, res, next) => {
 // Serve uploaded files as static assets
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
+// Root and health endpoints (for networkMonitor latency pings & load balancers)
+app.get("/", (req, res) => {
+  res.status(200).json({ status: "ok", service: "lpg-backend" });
+});
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: "ok", service: "lpg-backend" });
+});
+
 // Auth routes (unprotected)
 app.use("/api/auth", routes);
 app.use("/api/agencies", agencyRoutes);

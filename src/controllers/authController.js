@@ -60,11 +60,27 @@ const saveOtpLog = async ({ userId, identifier, otp, stage }) => {
 
 const getUserByIdentifier = async (identifier) => {
   const value = normalizeIdentifier(identifier);
-  const digits = normalizePhoneDigits(value);
-  
   if (!value) return null;
 
-  let query = `
+  const isEmail = value.includes("@");
+  const digits = normalizePhoneDigits(value);
+  const lastTenDigits = digits && digits.length >= 10 ? digits.slice(-10) : digits;
+
+  let whereSql = "";
+  let params = [];
+
+  if (isEmail) {
+    whereSql = "WHERE LOWER(u.email) = LOWER(?)";
+    params.push(value);
+  } else {
+    // Exact phone matches first (uses index), fallback to normalized 10 digits
+    const candidates = Array.from(new Set([value, digits, lastTenDigits, `+91${lastTenDigits}`].filter(Boolean)));
+    const placeholders = candidates.map(() => "?").join(", ");
+    whereSql = `WHERE u.phone IN (${placeholders}) OR RIGHT(REPLACE(REPLACE(REPLACE(u.phone, '+', ''), '-', ''), ' ', ''), 10) = ?`;
+    params.push(...candidates, lastTenDigits || value);
+  }
+
+  const query = `
     SELECT u.id, u.name, u.company_name, u.email, u.phone, u.password,
            COALESCE(
              CASE 
@@ -82,21 +98,9 @@ const getUserByIdentifier = async (identifier) => {
     FROM users u
     LEFT JOIN user_job_profiles ujp ON u.id = ujp.user_id
     LEFT JOIN agencies a ON u.agency_id = a.id
-    WHERE LOWER(u.email) = LOWER(?)
+    ${whereSql}
+    LIMIT 1
   `;
-  let params = [value];
-
-  if (digits) {
-    const lastTenDigits = digits.length >= 10 ? digits.slice(-10) : digits;
-    query += `
-      OR u.phone = ?
-      OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', '') = ?
-      OR RIGHT(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(u.phone, '+', ''), '-', ''), ' ', ''), '(', ''), ')', ''), '.', ''), 10) = ?
-    `;
-    params.push(value, digits, lastTenDigits);
-  }
-
-  query += ` LIMIT 1`;
 
   const [rows] = await db.execute(query, params);
 

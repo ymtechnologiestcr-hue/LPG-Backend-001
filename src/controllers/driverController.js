@@ -663,6 +663,7 @@ export const getDriverDeliveriesApp = async (req, res) => {
       `
       SELECT
         s.id AS sale_id,
+        s.customer_id,
         u.name AS customer_name,
         u.consumer_number,
         a.address,
@@ -701,6 +702,7 @@ export const getDriverDeliveriesApp = async (req, res) => {
         AND DATE(COALESCE(s.delivered_at, s.created_at)) BETWEEN ? AND ?
       GROUP BY
         s.id,
+        s.customer_id,
         u.name,
         u.consumer_number,
         a.address,
@@ -854,6 +856,7 @@ export const getDriverDeliveriesApp = async (req, res) => {
 
     const deliveries = deliveryRows.map((item) => ({
       saleId: Number(item.sale_id),
+      customerId: item.customer_id ? Number(item.customer_id) : null,
       customerName: item.customer_name || "Unknown Customer",
       consumerNumber: item.consumer_number || null,
       address: item.address || "No address available",
@@ -1352,9 +1355,23 @@ export const createDriverSale = async (req, res) => {
 
     let customerId = customer_id ? Number(customer_id) : null;
 
+    // Verify if the passed customerId actually exists in the users table
+    if (customerId && customerId > 0) {
+      const [existingUserRows] = await connection.execute(
+        `SELECT id FROM users WHERE id = ? LIMIT 1`,
+        [customerId],
+      );
+      if (!existingUserRows.length) {
+        console.warn(`createDriverSale: customer_id ${customerId} does not exist in users table; re-resolving by phone/name.`);
+        customerId = null;
+      }
+    } else {
+      customerId = null;
+    }
+
     if (!customerId && allocation_sale_id) {
       const [origSaleRows] = await connection.execute(
-        `SELECT customer_id FROM sales WHERE id = ? LIMIT 1`,
+        `SELECT s.customer_id FROM sales s INNER JOIN users u ON u.id = s.customer_id WHERE s.id = ? LIMIT 1`,
         [Number(allocation_sale_id)],
       );
       if (origSaleRows.length && origSaleRows[0].customer_id) {
@@ -1376,6 +1393,18 @@ export const createDriverSale = async (req, res) => {
       );
     }
 
+    if (!customerId && !existingCustomers.length && customer_name && String(customer_name).trim() !== "") {
+      [existingCustomers] = await connection.execute(
+        `
+        SELECT id
+        FROM users
+        WHERE name = ? AND agency_id = ? AND role = 'CUSTOMER'
+        LIMIT 1
+        `,
+        [String(customer_name).trim(), agencyId],
+      );
+    }
+
     if (!customerId) {
       if (existingCustomers.length) {
         customerId = existingCustomers[0].id;
@@ -1383,7 +1412,7 @@ export const createDriverSale = async (req, res) => {
         await connection.execute(
           `
           UPDATE users
-          SET name = ?, role = 'CUSTOMER'
+          SET name = COALESCE(?, name), role = 'CUSTOMER'
           WHERE id = ?
           `,
           [customer_name, customerId],
@@ -1411,35 +1440,41 @@ export const createDriverSale = async (req, res) => {
 
     let addressId = null;
 
-    const [addressRows] = await connection.execute(
-      `
-      SELECT id
-      FROM addresses
-      WHERE user_id = ?
-        AND address = ?
-      LIMIT 1
-      `,
-      [customerId, address],
-    );
+    if (customerId && address && String(address).trim() !== "") {
+      try {
+        const [addressRows] = await connection.execute(
+          `
+          SELECT id
+          FROM addresses
+          WHERE user_id = ?
+            AND address = ?
+          LIMIT 1
+          `,
+          [customerId, address],
+        );
 
-    if (addressRows.length) {
-      addressId = addressRows[0].id;
-    } else {
-      const [addressResult] = await connection.execute(
-        `
-        INSERT INTO addresses
-        (
-          user_id,
-          address,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, NOW(), NOW())
-        `,
-        [customerId, address],
-      );
+        if (addressRows.length) {
+          addressId = addressRows[0].id;
+        } else {
+          const [addressResult] = await connection.execute(
+            `
+            INSERT INTO addresses
+            (
+              user_id,
+              address,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, NOW(), NOW())
+            `,
+            [customerId, address],
+          );
 
-      addressId = addressResult.insertId;
+          addressId = addressResult.insertId;
+        }
+      } catch (addrErr) {
+        console.warn("createDriverSale: Could not save address to addresses table:", addrErr.message);
+      }
     }
 
     const unitPrice = Number(selectedProduct.price || 0);

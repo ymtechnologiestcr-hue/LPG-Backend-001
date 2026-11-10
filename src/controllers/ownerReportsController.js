@@ -1,5 +1,4 @@
 import db from "../config/db.js";
-import { ensureSchemaUpdated } from "../utils/schemaMigrations.js";
 
 const getISTTodayStr = () => {
   const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -110,7 +109,6 @@ const parseReportDateRange = (req) => {
 export const getOwnerSalesDetailedReport = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const agencyId = req.user?.agency_id || 1;
     const { start, end, startDate, endDate, label } = parseReportDateRange(req);
     const { driverId, productId, customerId } = req.query;
@@ -361,7 +359,6 @@ export const getOwnerSalesDetailedReport = async (req, res) => {
 export const getOwnerDriverManagement = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const agencyId = req.user?.agency_id || 1;
     const { startDate, endDate } = parseReportDateRange(req);
 
@@ -607,7 +604,6 @@ export const getOwnerDriverManagement = async (req, res) => {
 export const updateDriverVehicleDocuments = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const { driverId } = req.params;
     const { vehicleNumber, pollutionExpiry, fitnessExpiry, explosivesExpiry } = req.body;
 
@@ -644,7 +640,6 @@ export const updateDriverVehicleDocuments = async (req, res) => {
 export const getOwnerDriverCashSettlements = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const agencyId = req.user?.agency_id || 1;
     const { startDate, endDate } = parseReportDateRange(req);
 
@@ -744,7 +739,6 @@ export const getOwnerDriverCashSettlements = async (req, res) => {
 export const getOwnerCreditSales = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const agencyId = req.user?.agency_id || 1;
     const { startDate, endDate } = parseReportDateRange(req);
 
@@ -845,7 +839,6 @@ export const getOwnerCreditSales = async (req, res) => {
 export const recordCreditSalePayment = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const { saleId } = req.params;
     const { amount, paymentMethod = "CASH", paymentDate = getISTTodayStr(), notes = "" } = req.body;
 
@@ -936,7 +929,6 @@ export const recordCreditSalePayment = async (req, res) => {
 export const getCreditSalePaymentHistory = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const { saleId } = req.params;
 
     const [payments] = await connection.query(
@@ -1385,7 +1377,6 @@ export const getOwnerComplaintsLogReport = async (req, res) => {
 export const getOwnerCashFlowReport = async (req, res) => {
   const connection = await db.getConnection();
   try {
-    await ensureSchemaUpdated(connection);
     const agencyId = req.user?.agency_id || 1;
     const { start, end, startDate, endDate, label } = parseReportDateRange(req);
 
