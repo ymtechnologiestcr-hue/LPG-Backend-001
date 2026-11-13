@@ -1,4 +1,7 @@
+import bcrypt from "bcryptjs";
 import db from "../config/db.js";
+
+const DEFAULT_OWNER_PASSWORD = process.env.DEFAULT_OWNER_PASSWORD || "password@123";
 
 export const registerAgency = async (req, res) => {
   const connection = await db.getConnection();
@@ -107,17 +110,19 @@ export const registerAgency = async (req, res) => {
     const agencyId = agencyResult.insertId;
 
     // 4. Create an OWNER user for this new agency
-    // The owner can log in using OTP via the phone number or email provided.
+    // Store a bcrypt hash so the owner can use password login immediately.
+    const hashedOwnerPassword = await bcrypt.hash(DEFAULT_OWNER_PASSWORD, 10);
     await connection.execute(
       `
-      INSERT INTO users (name, company_name, email, phone, role, status, agency_id)
-      VALUES (?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
+      INSERT INTO users (name, company_name, email, phone, password, role, status, agency_id)
+      VALUES (?, ?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
       `,
       [
         agency_name, // Defaulting owner name to agency name initially
         agency_name,
         email_id,
         phone_number,
+        hashedOwnerPassword,
         agencyId,
       ],
     );
