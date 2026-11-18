@@ -1291,6 +1291,186 @@ export const getOwnerJobAssignmentUsers = async (req, res) => {
   }
 };
 
+/**
+ * Helper to check whether an email is already in use, and specifically
+ * whether it belongs to a user with the same role across different agencies.
+ */
+const findEmailConflict = async (connection, email, role, excludeUserId = null) => {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail) return null;
+
+  const normalizedRole = String(role || "").trim().toUpperCase();
+  const systemRole = JOB_ROLE_TO_SYSTEM_ROLE[normalizedRole];
+
+  const [profileTableRows] = await connection.query(
+    `SHOW TABLES LIKE 'user_job_profiles'`,
+  );
+  const hasProfileTable = profileTableRows.length > 0;
+
+  let query = `
+    SELECT
+      u.id,
+      u.name,
+      u.email,
+      u.phone,
+      u.role AS system_role,
+      u.status,
+      u.agency_id,
+      COALESCE(a.agency_name, u.company_name, CONCAT('Agency #', u.agency_id)) AS agency_name,
+      ${hasProfileTable ? "up.display_role" : "NULL"} AS display_role
+    FROM users u
+    LEFT JOIN agencies a ON a.id = u.agency_id
+    ${hasProfileTable ? "LEFT JOIN user_job_profiles up ON up.user_id = u.id" : ""}
+    WHERE LOWER(u.email) = ?
+  `;
+  const params = [normalizedEmail];
+
+  if (excludeUserId && !Number.isNaN(Number(excludeUserId))) {
+    query += ` AND u.id != ?`;
+    params.push(Number(excludeUserId));
+  }
+
+  query += ` LIMIT 1`;
+
+  const [rows] = await connection.query(query, params);
+  if (!rows.length) return null;
+
+  const existingUser = rows[0];
+  const existingAgencyId = Number(existingUser.agency_id);
+  const existingAgencyName = existingUser.agency_name || `Agency #${existingAgencyId}`;
+  const existingDisplayRole = existingUser.display_role || null;
+  const existingSystemRole = existingUser.system_role || null;
+  const existingRoleLabel =
+    JOB_ROLE_LABELS[existingDisplayRole] ||
+    existingDisplayRole ||
+    existingSystemRole ||
+    "Staff";
+
+  // Check if same role (display role or system role)
+  const isSameRole =
+    Boolean(normalizedRole && existingDisplayRole && normalizedRole === existingDisplayRole) ||
+    Boolean(systemRole && existingSystemRole && systemRole === existingSystemRole) ||
+    Boolean(normalizedRole && existingSystemRole && normalizedRole === existingSystemRole);
+
+  return {
+    existingUser,
+    existingAgencyId,
+    existingAgencyName,
+    existingDisplayRole,
+    existingSystemRole,
+    existingRoleLabel,
+    isSameRole,
+  };
+};
+
+/**
+ * Dedicated endpoint to check if an email is available for job assignment.
+ * Enforces rule: same user email cannot co-exist between different agencies for the same role.
+ * e.g. suraj@gmail.com cannot be a PURCHASE_DRIVER in Agency 1 and also in Agency 2.
+ */
+export const checkOwnerJobAssignmentEmailAvailability = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    const email = req.method === "POST" ? req.body?.email : req.query?.email;
+    const role = req.method === "POST" ? req.body?.role : req.query?.role;
+    const excludeUserId = req.method === "POST" ? req.body?.excludeUserId : req.query?.excludeUserId;
+
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      return res.status(400).json({
+        success: false,
+        available: false,
+        message: "Email is required",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        available: false,
+        message: "Please enter a valid email address",
+      });
+    }
+
+    const currentAgencyId = Number(req.user?.agency_id || 1);
+    const conflict = await findEmailConflict(connection, normalizedEmail, role, excludeUserId);
+
+    if (!conflict) {
+      return res.status(200).json({
+        success: true,
+        available: true,
+        message: "Email is available",
+      });
+    }
+
+    const { existingUser, existingAgencyId, existingAgencyName, existingRoleLabel, isSameRole } = conflict;
+
+    if (isSameRole) {
+      if (existingAgencyId !== currentAgencyId) {
+        return res.status(200).json({
+          success: true,
+          available: false,
+          conflictType: "SAME_ROLE_ACROSS_AGENCIES",
+          message: `Email "${normalizedEmail}" is already registered as ${existingRoleLabel} in ${existingAgencyName} (Agency #${existingAgencyId}). A user cannot hold the same role across different agencies.`,
+          existingUser: {
+            id: Number(existingUser.id),
+            name: existingUser.name,
+            email: existingUser.email,
+            role: conflict.existingDisplayRole || conflict.existingSystemRole,
+            roleLabel: existingRoleLabel,
+            agencyId: existingAgencyId,
+            agencyName: existingAgencyName,
+          },
+        });
+      } else {
+        return res.status(200).json({
+          success: true,
+          available: false,
+          conflictType: "SAME_ROLE_SAME_AGENCY",
+          message: `Email "${normalizedEmail}" is already assigned to ${existingUser.name} as ${existingRoleLabel} in this agency.`,
+          existingUser: {
+            id: Number(existingUser.id),
+            name: existingUser.name,
+            email: existingUser.email,
+            role: conflict.existingDisplayRole || conflict.existingSystemRole,
+            roleLabel: existingRoleLabel,
+            agencyId: existingAgencyId,
+            agencyName: existingAgencyName,
+          },
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      available: false,
+      conflictType: "EMAIL_ALREADY_EXISTS",
+      message: `Email "${normalizedEmail}" is already in use by ${existingUser.name} (${existingRoleLabel}) in ${existingAgencyName}.`,
+      existingUser: {
+        id: Number(existingUser.id),
+        name: existingUser.name,
+        email: existingUser.email,
+        role: conflict.existingDisplayRole || conflict.existingSystemRole,
+        roleLabel: existingRoleLabel,
+        agencyId: existingAgencyId,
+        agencyName: existingAgencyName,
+      },
+    });
+  } catch (error) {
+    console.error("checkOwnerJobAssignmentEmailAvailability error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to check email availability",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
 export const createOwnerJobAssignmentUser = async (req, res) => {
   const connection = await db.getConnection();
   let transactionStarted = false;
@@ -1361,15 +1541,38 @@ export const createOwnerJobAssignmentUser = async (req, res) => {
       });
     }
 
-    const [existingEmail] = await connection.query(
-      `SELECT id FROM users WHERE email = ? LIMIT 1`,
-      [normalizedEmail],
+    const emailConflict = await findEmailConflict(
+      connection,
+      normalizedEmail,
+      normalizedRole,
     );
 
-    if (existingEmail.length) {
+    if (emailConflict) {
+      const {
+        existingUser,
+        existingAgencyId,
+        existingAgencyName,
+        existingRoleLabel,
+        isSameRole,
+      } = emailConflict;
+
+      if (isSameRole) {
+        if (existingAgencyId !== Number(req.user.agency_id)) {
+          return res.status(400).json({
+            success: false,
+            message: `Email "${normalizedEmail}" is already registered as ${existingRoleLabel} in ${existingAgencyName} (Agency #${existingAgencyId}). A user cannot hold the same role across different agencies.`,
+          });
+        } else {
+          return res.status(400).json({
+            success: false,
+            message: `Email "${normalizedEmail}" is already assigned to ${existingUser.name} as ${existingRoleLabel} in your agency.`,
+          });
+        }
+      }
+
       return res.status(400).json({
         success: false,
-        message: "Email already exists",
+        message: `Email "${normalizedEmail}" is already in use by ${existingUser.name} (${existingRoleLabel}) in ${existingAgencyName}.`,
       });
     }
 
@@ -1612,6 +1815,63 @@ export const updateOwnerJobAssignmentUser = async (req, res) => {
       bankAccountNumber,
       bankIfscCode,
     } = req.body;
+
+    if (email !== undefined && email !== null && String(email).trim()) {
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const [currentUserRows] = await connection.query(
+        `
+        SELECT u.role, up.display_role
+        FROM users u
+        LEFT JOIN user_job_profiles up ON up.user_id = u.id
+        WHERE u.id = ? AND u.agency_id = ?
+        LIMIT 1
+        `,
+        [userId, req.user.agency_id],
+      );
+      if (!currentUserRows.length) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      const userRole =
+        currentUserRows[0].display_role || currentUserRows[0].role;
+      const emailConflict = await findEmailConflict(
+        connection,
+        normalizedEmail,
+        userRole,
+        userId,
+      );
+
+      if (emailConflict) {
+        const {
+          existingUser,
+          existingAgencyId,
+          existingAgencyName,
+          existingRoleLabel,
+          isSameRole,
+        } = emailConflict;
+
+        if (isSameRole) {
+          if (existingAgencyId !== Number(req.user.agency_id)) {
+            return res.status(400).json({
+              success: false,
+              message: `Email "${normalizedEmail}" is already registered as ${existingRoleLabel} in ${existingAgencyName} (Agency #${existingAgencyId}). A user cannot hold the same role across different agencies.`,
+            });
+          } else {
+            return res.status(400).json({
+              success: false,
+              message: `Email "${normalizedEmail}" is already assigned to ${existingUser.name} as ${existingRoleLabel} in your agency.`,
+            });
+          }
+        }
+
+        return res.status(400).json({
+          success: false,
+          message: `Email "${normalizedEmail}" is already in use by ${existingUser.name} (${existingRoleLabel}) in ${existingAgencyName}.`,
+        });
+      }
+    }
 
     await connection.beginTransaction();
     transactionStarted = true;

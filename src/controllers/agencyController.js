@@ -1,7 +1,8 @@
 import bcrypt from "bcryptjs";
 import db from "../config/db.js";
 
-const DEFAULT_OWNER_PASSWORD = process.env.DEFAULT_OWNER_PASSWORD || "password@123";
+const DEFAULT_OWNER_PASSWORD =
+  process.env.DEFAULT_OWNER_PASSWORD || "password@123";
 
 export const registerAgency = async (req, res) => {
   const connection = await db.getConnection();
@@ -16,16 +17,32 @@ export const registerAgency = async (req, res) => {
     }
 
     // Support both snake_case and camelCase inputs, safely trim strings
-    const agency_name = (req.body.agency_name || req.body.agencyName || "").toString().trim();
-    const gst_number = (req.body.gst_number || req.body.gstNumber || "").toString().trim();
-    const phone_number = (req.body.phone_number || req.body.phoneNumber || "").toString().trim();
-    const email_id = (req.body.email_id || req.body.emailId || "").toString().trim();
+    const agency_name = (req.body.agency_name || req.body.agencyName || "")
+      .toString()
+      .trim();
+    const gst_number = (req.body.gst_number || req.body.gstNumber || "")
+      .toString()
+      .trim();
+    const phone_number = (req.body.phone_number || req.body.phoneNumber || "")
+      .toString()
+      .trim();
+    const email_id = (req.body.email_id || req.body.emailId || "")
+      .toString()
+      .trim();
     const address = (req.body.address || "").toString().trim();
     const state = (req.body.state || "").toString().trim();
     const district = (req.body.district || "").toString().trim();
-    const pin_code = (req.body.pin_code || req.body.pinCode || "").toString().trim();
-    const subscription_plan = (req.body.subscription_plan || req.body.subscriptionPlan || "").toString().trim();
-    
+    const pin_code = (req.body.pin_code || req.body.pinCode || "")
+      .toString()
+      .trim();
+    const subscription_plan = (
+      req.body.subscription_plan ||
+      req.body.subscriptionPlan ||
+      ""
+    )
+      .toString()
+      .trim();
+
     // Handle boolean or string boolean for terms
     let terms_accepted = req.body.terms_accepted ?? req.body.agreedToTerms;
     if (terms_accepted === "true") terms_accepted = true;
@@ -110,19 +127,17 @@ export const registerAgency = async (req, res) => {
     const agencyId = agencyResult.insertId;
 
     // 4. Create an OWNER user for this new agency
-    // Store a bcrypt hash so the owner can use password login immediately.
-    const hashedOwnerPassword = await bcrypt.hash(DEFAULT_OWNER_PASSWORD, 10);
+    // The owner can log in using OTP via the phone number or email provided.
     await connection.execute(
       `
-      INSERT INTO users (name, company_name, email, phone, password, role, status, agency_id)
-      VALUES (?, ?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
+      INSERT INTO users (name, company_name, email, phone, role, status, agency_id)
+      VALUES (?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
       `,
       [
         agency_name, // Defaulting owner name to agency name initially
         agency_name,
         email_id,
         phone_number,
-        hashedOwnerPassword,
         agencyId,
       ],
     );

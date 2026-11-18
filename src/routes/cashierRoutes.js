@@ -30,6 +30,9 @@ import {
   getCashierNewConnectionRequests,
   collectCashierNewConnectionRequest,
   getCashFlowEntriesByDate,
+  getCashierCreditSales,
+  settleCashierCreditSale,
+  getCashierCreditSalePaymentHistory,
 } from "../controllers/cashierController.js";
 import {
   getCashierDailySalesReport,
@@ -70,6 +73,11 @@ router.post("/receipt", recordCashierReceipt);
 // Cash In -> Other Receipts (advance / due collection / other)
 router.post("/receipts", createCashierReceipt);
 router.get("/receipts/recent", getRecentCashierReceipts);
+
+// Cash In -> Credit Sales
+router.get("/credit-sales", getCashierCreditSales);
+router.post("/credit-sales/:saleId/settle", settleCashierCreditSale);
+router.get("/credit-sales/:saleId/history", getCashierCreditSalePaymentHistory);
 router.get("/cash-flow/today", getTodaysCashFlow);
 router.get("/cash-flow/entries", getCashFlowEntriesByDate);
 router.get("/customers/find", findCustomerForCashierApp);

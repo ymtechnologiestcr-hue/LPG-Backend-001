@@ -1179,13 +1179,25 @@ export const getCashierDriverCollections = async (req, res) => {
       "sh.driver_id = d.id AND sh.status IN ('ASSIGNED', 'PENDING', 'SETTLED') AND sh.agency_id = ?";
     const queryParams = [];
 
-    // 1. iocOnlineCount correlated subquery params (appears first in SELECT)
+    // 1. totalDeliveries correlated subquery params
+    queryParams.push(req.user.agency_id);
+    if (hasRange) {
+      queryParams.push(startDate, endDate);
+    }
+
+    // 2. totalCylinders correlated subquery params
+    queryParams.push(req.user.agency_id);
+    if (hasRange) {
+      queryParams.push(startDate, endDate);
+    }
+
+    // 3. iocOnlineCount correlated subquery params (appears next in SELECT)
     queryParams.push(req.user.agency_id);
     if (hasRange) {
       queryParams.push(startDate, endDate); // for iocOnlineCount subquery
     }
 
-    // 2. settlement_history JOIN params (appears second in FROM/JOIN)
+    // 4. settlement_history JOIN params (appears in FROM/JOIN)
     queryParams.push(req.user.agency_id);
     if (hasRange) {
       joinCondition +=
@@ -1193,16 +1205,35 @@ export const getCashierDriverCollections = async (req, res) => {
       queryParams.push(startDate, endDate, startDate); // for settlement_history JOIN
     }
 
-    // 3. WHERE u.agency_id = ?
+    // 5. WHERE u.agency_id = ?
     queryParams.push(req.user.agency_id);
 
-    // 4. LIMIT & OFFSET
+    // 6. LIMIT & OFFSET
     queryParams.push(limit, offset);
     const [rows] = await connection.query(
       `
       SELECT
         d.id AS driver_id,
         u.name AS driverName,
+        -- totalDeliveries: count of distinct DELIVERED sales in range
+        COALESCE((
+          SELECT COUNT(DISTINCT s_del.id)
+          FROM sales s_del
+          WHERE s_del.driver_id = d.id
+            AND s_del.status = 'DELIVERED'
+            AND s_del.agency_id = ?
+            ${hasRange ? "AND DATE(COALESCE(s_del.delivered_at, s_del.created_at)) BETWEEN ? AND ?" : ""}
+        ), 0) AS totalDeliveries,
+        -- totalCylinders: count of cylinders delivered
+        COALESCE((
+          SELECT SUM(COALESCE(si_del.delivered_qty, si_del.quantity, 0))
+          FROM sales_items si_del
+          JOIN sales s_del ON s_del.id = si_del.sale_id
+          WHERE s_del.driver_id = d.id
+            AND s_del.status = 'DELIVERED'
+            AND s_del.agency_id = ?
+            ${hasRange ? "AND DATE(COALESCE(s_del.delivered_at, s_del.created_at)) BETWEEN ? AND ?" : ""}
+        ), 0) AS totalCylinders,
         -- cash/upi collected: based on the original sale's payment method.
         -- This ensures that even if a driver settles CASH via UPI, the collected stats remain true to the source.
         COALESCE(SUM(CASE WHEN s.payment_method = 'CASH' THEN sh.amount ELSE 0 END), 0) AS cashCollected,
@@ -1285,6 +1316,8 @@ export const getCashierDriverCollections = async (req, res) => {
           assignedCount: Number(driver.assignedCount || 0),
           settledCount: Number(driver.settledCount || 0),
           iocOnlineCount: Number(driver.iocOnlineCount || 0),
+          totalDeliveries: Number(driver.totalDeliveries || 0),
+          totalCylinders: Number(driver.totalCylinders || 0),
         };
       }),
       pagination: {
@@ -4538,6 +4571,318 @@ export const getCashFlowEntriesByDate = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch cash flow entries by date",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+/**
+ * Fetch all Credit Sales made by drivers for this agency
+ */
+export const getCashierCreditSales = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    let agencyId = req.user?.agency_id;
+    if (!agencyId && req.user?.id) {
+      const [uRows] = await connection.execute("SELECT agency_id FROM users WHERE id = ? LIMIT 1", [req.user.id]);
+      agencyId = uRows[0]?.agency_id;
+    }
+    agencyId = agencyId ? Number(agencyId) : 1;
+
+    const { startDate, endDate, status, search } = req.query;
+
+    let filterSql = "";
+    const params = [agencyId];
+
+    if (startDate && endDate) {
+      filterSql += " AND DATE(CONVERT_TZ(s.created_at, '+00:00', '+05:30')) BETWEEN ? AND ?";
+      params.push(startDate, endDate);
+    }
+
+    if (status && status !== "ALL") {
+      if (status === "PAID") {
+        filterSql += " AND (s.credit_status = 'PAID' OR (s.pending_amount <= 0 AND s.amount_received > 0))";
+      } else if (status === "PARTIAL") {
+        filterSql += " AND (s.credit_status = 'PARTIAL' OR (s.amount_received > 0 AND s.pending_amount > 0))";
+      } else if (status === "PENDING") {
+        filterSql += " AND (s.credit_status = 'PENDING' OR s.credit_status IS NULL) AND (s.amount_received = 0 OR s.amount_received IS NULL)";
+      }
+    }
+
+    if (search && String(search).trim()) {
+      const q = `%${String(search).trim()}%`;
+      filterSql += " AND (cu.name LIKE ? OR cu.consumer_number LIKE ? OR cu.phone LIKE ? OR du.name LIKE ? OR s.id LIKE ?)";
+      params.push(q, q, q, q, q);
+    }
+
+    const [rows] = await connection.query(
+      `
+      SELECT
+        s.id AS sale_id,
+        DATE_FORMAT(CONVERT_TZ(s.created_at, '+00:00', '+05:30'), '%d/%m/%Y %h:%i %p') AS created_at_formatted,
+        DATE_FORMAT(CONVERT_TZ(s.created_at, '+00:00', '+05:30'), '%d/%m/%Y') AS date,
+        CONCAT('VCH-', s.id) AS voucher_number,
+        d.id AS driver_id,
+        COALESCE(du.name, 'Direct Office') AS driver_name,
+        COALESCE(du.phone, '') AS driver_phone,
+        cu.id AS customer_id,
+        COALESCE(cu.name, 'Customer') AS customer_name,
+        COALESCE(cu.consumer_number, 'N/A') AS consumer_number,
+        COALESCE(cu.phone, '') AS customer_phone,
+        COALESCE(a.address, '') AS customer_address,
+        p.id AS product_id,
+        COALESCE(p.name, 'LPG Cylinder') AS product_name,
+        COALESCE(p.type, 'COMMERCIAL') AS product_type,
+        COALESCE(si.batch_no, CONCAT('B-', s.id)) AS batch_no,
+        COALESCE(si.quantity, 1) AS quantity,
+        COALESCE(si.delivered_qty, si.quantity, 1) AS delivered_qty,
+        COALESCE(si.price, p.price, 0) AS unit_price,
+        COALESCE(s.total_amount, 0) AS total_amount,
+        COALESCE(s.amount_received, 0) AS amount_received,
+        COALESCE(s.pending_amount, s.total_amount) AS pending_amount,
+        COALESCE(s.credit_status, 'PENDING') AS credit_status,
+        s.payment_method,
+        s.empty_cylinder_qty,
+        s.empty_cylinder_status,
+        s.created_at
+      FROM sales s
+      LEFT JOIN sales_items si ON si.sale_id = s.id
+      LEFT JOIN products p ON p.id = si.product_id
+      LEFT JOIN users cu ON cu.id = s.customer_id
+      LEFT JOIN addresses a ON a.id = s.address_id
+      LEFT JOIN drivers d ON d.id = s.driver_id
+      LEFT JOIN users du ON du.id = d.user_id
+      WHERE s.agency_id = ?
+        AND s.payment_method = 'CREDIT'
+        ${filterSql}
+      ORDER BY s.created_at DESC, s.id DESC
+      `,
+      params
+    );
+
+    let totalAmountAll = 0;
+    let totalReceivedAll = 0;
+    let totalPendingAll = 0;
+
+    const items = rows.map((r) => {
+      const totalAmount = Number(r.total_amount || 0);
+      const received = Number(r.amount_received || 0);
+      const pending = Number(
+        r.pending_amount !== null && r.pending_amount !== undefined && (Number(r.pending_amount) > 0 || received > 0)
+          ? r.pending_amount
+          : (totalAmount - received)
+      );
+
+      const isPaid = (r.credit_status === "PAID" || pending <= 0) && received > 0;
+      const isPartial = received > 0 && pending > 0;
+      const status = isPaid ? "Paid" : isPartial ? "Partially Paid" : "Pending";
+
+      totalAmountAll += totalAmount;
+      totalReceivedAll += received;
+      totalPendingAll += pending;
+
+      return {
+        saleId: r.sale_id,
+        voucherNumber: r.voucher_number,
+        date: r.date,
+        createdAtFormatted: r.created_at_formatted,
+        driverId: r.driver_id,
+        driverName: r.driver_name,
+        driverPhone: r.driver_phone,
+        customerId: r.customer_id,
+        customerName: r.customer_name,
+        customerPhone: r.customer_phone,
+        consumerNumber: r.consumer_number,
+        customerAddress: r.customer_address,
+        product: {
+          id: r.product_id,
+          name: r.product_name,
+          type: r.product_type,
+        },
+        batch: {
+          batchNo: r.batch_no,
+        },
+        quantity: Number(r.quantity || 1),
+        deliveredQty: Number(r.delivered_qty || 1),
+        unitPrice: Number(r.unit_price || 0),
+        totalAmount,
+        amountReceived: received,
+        pendingAmount: Math.max(0, pending),
+        status,
+        creditStatus: r.credit_status,
+        paymentMethod: r.payment_method,
+        emptyCylinderQty: Number(r.empty_cylinder_qty || 0),
+        emptyCylinderStatus: r.empty_cylinder_status,
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      summary: {
+        totalCreditSales: totalAmountAll,
+        totalSettled: totalReceivedAll,
+        totalPending: totalPendingAll,
+        pendingCount: items.filter((i) => i.status !== "Paid").length,
+        settledCount: items.filter((i) => i.status === "Paid").length,
+        totalCount: items.length,
+      },
+      data: items,
+    });
+  } catch (error) {
+    console.error("getCashierCreditSales error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch credit sales",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+/**
+ * Settle Credit Sale by Cashier (CASH or UPI)
+ */
+export const settleCashierCreditSale = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { saleId } = req.params;
+    const { amount, paymentMethod = "CASH", notes = "", paymentDate } = req.body;
+
+    const numAmount = Number(amount);
+    if (!numAmount || numAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Valid payment amount is required" });
+    }
+
+    const normalizedPaymentMethod = String(paymentMethod).toUpperCase() === "UPI" ? "UPI" : "CASH";
+
+    let agencyId = req.user?.agency_id;
+    if (!agencyId && req.user?.id) {
+      const [uRows] = await connection.execute("SELECT agency_id FROM users WHERE id = ? LIMIT 1", [req.user.id]);
+      agencyId = uRows[0]?.agency_id;
+    }
+    agencyId = agencyId ? Number(agencyId) : 1;
+
+    await connection.beginTransaction();
+
+    const [sales] = await connection.query(
+      `SELECT id, agency_id, total_amount, amount_received, pending_amount, customer_id FROM sales WHERE id = ? AND payment_method = 'CREDIT' FOR UPDATE`,
+      [saleId]
+    );
+
+    if (sales.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ success: false, message: "Credit sale record not found" });
+    }
+
+    const sale = sales[0];
+    const totalAmount = Number(sale.total_amount || 0);
+    const currentReceived = Number(sale.amount_received || 0);
+    const newReceived = currentReceived + numAmount;
+    const newPending = Math.max(0, totalAmount - newReceived);
+    const newStatus = newPending <= 0 ? "PAID" : "PARTIAL";
+
+    // 1. Update sales record
+    await connection.query(
+      `
+      UPDATE sales
+      SET
+        amount_received = ?,
+        pending_amount = ?,
+        credit_status = ?,
+        updated_at = NOW()
+      WHERE id = ?
+      `,
+      [newReceived, newPending, newStatus, saleId]
+    );
+
+    // 2. Insert into credit_sales_payments
+    const effectivePaymentDate = paymentDate || new Date().toISOString().slice(0, 10);
+    await connection.query(
+      `
+      INSERT INTO credit_sales_payments
+      (agency_id, sale_id, amount, payment_method, payment_date, notes, recorded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      [sale.agency_id, saleId, numAmount, normalizedPaymentMethod, effectivePaymentDate, notes, req.user?.id || null]
+    );
+
+    // 3. Keep credit settlement tracked in cashier records with unique receipt_type
+    const receiptDesc = notes ? `Credit Sale VCH-${saleId} - ${notes}` : `Credit Sale Settlement VCH-${saleId}`;
+    await connection.query(
+      `
+      INSERT INTO cashier_receipts
+      (agency_id, cashier_id, receipt_type, amount, description, payment_mode, created_at)
+      VALUES (?, ?, 'DUE_COLLECTION', ?, ?, ?, NOW())
+      `,
+      [sale.agency_id, req.user?.id || 1, numAmount, receiptDesc, normalizedPaymentMethod]
+    );
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: "Credit sale settled successfully",
+      data: {
+        saleId: Number(saleId),
+        amountSettled: numAmount,
+        totalAmount,
+        amountReceived: newReceived,
+        pendingAmount: newPending,
+        status: newStatus === "PAID" ? "Paid" : "Partially Paid",
+        paymentMethod: normalizedPaymentMethod,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("settleCashierCreditSale error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to settle credit sale",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+/**
+ * Get payment history for a specific credit sale
+ */
+export const getCashierCreditSalePaymentHistory = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const { saleId } = req.params;
+
+    const [payments] = await connection.query(
+      `
+      SELECT
+        csp.id,
+        DATE_FORMAT(CONVERT_TZ(csp.created_at, '+00:00', '+05:30'), '%d/%m/%Y %h:%i %p') AS created_at_formatted,
+        DATE_FORMAT(csp.payment_date, '%d/%m/%Y') AS payment_date,
+        csp.amount,
+        csp.payment_method,
+        csp.notes,
+        COALESCE(u.name, 'Cashier') AS recorded_by
+      FROM credit_sales_payments csp
+      LEFT JOIN users u ON u.id = csp.recorded_by
+      WHERE csp.sale_id = ?
+      ORDER BY csp.id DESC
+      `,
+      [saleId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: payments,
+    });
+  } catch (error) {
+    console.error("getCashierCreditSalePaymentHistory error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch payment history",
       error: error.message,
     });
   } finally {

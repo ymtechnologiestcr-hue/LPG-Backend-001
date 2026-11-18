@@ -19,6 +19,7 @@ import {
 	putOwnerStockProduct,
 	deleteOwnerStockProductEndpoint,
 	approveOwnerOfficeExpense,
+	checkOwnerJobAssignmentEmailAvailability,
 	createOwnerJobAssignmentUser,
 	updateOwnerJobAssignmentUserStatus,
 	updateOwnerJobAssignmentUser,
@@ -45,6 +46,8 @@ router.get("/dashboard", getOwnerDashboard);
 router.get("/dashboard/insights", getOwnerDashboardInsights);
 router.get("/expenses/dashboard", getOwnerExpensesDashboard);
 router.put("/expenses/:expenseId/approve", approveOwnerOfficeExpense);
+router.get("/job-assignment/check-email", checkOwnerJobAssignmentEmailAvailability);
+router.post("/job-assignment/check-email", checkOwnerJobAssignmentEmailAvailability);
 router.get("/job-assignment/users", getOwnerJobAssignmentUsers);
 router.post("/job-assignment/users", createOwnerJobAssignmentUser);
 router.patch("/job-assignment/users/:id/status", updateOwnerJobAssignmentUserStatus);

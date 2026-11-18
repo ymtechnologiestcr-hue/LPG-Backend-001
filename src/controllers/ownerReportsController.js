@@ -740,7 +740,21 @@ export const getOwnerCreditSales = async (req, res) => {
   const connection = await db.getConnection();
   try {
     const agencyId = req.user?.agency_id || 1;
-    const { startDate, endDate } = parseReportDateRange(req);
+
+    let dateFilterSql = "";
+    const params = [agencyId];
+
+    if (req.query.startDate && req.query.endDate) {
+      dateFilterSql = "AND s.created_at BETWEEN ? AND ?";
+      params.push(`${req.query.startDate} 00:00:00`, `${req.query.endDate} 23:59:59`);
+    } else if (req.query.date) {
+      dateFilterSql = "AND s.created_at BETWEEN ? AND ?";
+      params.push(`${req.query.date} 00:00:00`, `${req.query.date} 23:59:59`);
+    } else if (req.query.timeframe) {
+      const { startDate, endDate } = parseReportDateRange(req);
+      dateFilterSql = "AND s.created_at BETWEEN ? AND ?";
+      params.push(`${startDate} 00:00:00`, `${endDate} 23:59:59`);
+    }
 
     const [rows] = await connection.query(
       `
@@ -766,10 +780,10 @@ export const getOwnerCreditSales = async (req, res) => {
       LEFT JOIN users du ON du.id = d.user_id
       WHERE s.agency_id = ?
         AND s.payment_method = 'CREDIT'
-        AND s.created_at BETWEEN ? AND ?
+        ${dateFilterSql}
       ORDER BY s.created_at DESC, s.id DESC
       `,
-      [agencyId, `${startDate} 00:00:00`, `${endDate} 23:59:59`]
+      params
     );
 
     let totalAmountAll = 0;
@@ -779,14 +793,18 @@ export const getOwnerCreditSales = async (req, res) => {
     const items = rows.map((r) => {
       const totalAmount = Number(r.total_amount || 0);
       const received = Number(r.amount_received || 0);
-      const pending = Number(r.pending_amount !== undefined ? r.pending_amount : (totalAmount - received));
+      const pending = Number(
+        r.pending_amount !== null && r.pending_amount !== undefined && (Number(r.pending_amount) > 0 || received > 0)
+          ? r.pending_amount
+          : (totalAmount - received)
+      );
 
       // Commercial 18% GST breakdown
       const taxableValue = Math.round((totalAmount / 1.18) * 100) / 100;
       const cgst = Math.round((taxableValue * 0.09) * 100) / 100;
       const sgst = Math.round((taxableValue * 0.09) * 100) / 100;
 
-      const status = r.credit_status === "PAID" || pending <= 0
+      const status = (r.credit_status === "PAID" || pending <= 0) && received > 0
         ? "Paid"
         : received > 0
         ? "Partially Paid"
@@ -890,17 +908,17 @@ export const recordCreditSalePayment = async (req, res) => {
       [sale.agency_id, saleId, numAmount, paymentMethod, paymentDate, notes, req.user?.id || null]
     );
 
-    // 3. If paid by CASH, add to cashier_receipts so it reconciles with cash flow!
-    if (paymentMethod === "CASH") {
-      await connection.query(
-        `
-        INSERT INTO cashier_receipts
-        (agency_id, cashier_id, customer_name, receipt_type, amount, notes, payment_mode, created_at)
-        VALUES (?, ?, ?, 'CREDIT_PAYMENT', ?, ?, 'CASH', NOW())
-        `,
-        [sale.agency_id, req.user?.id || 1, `Credit Payment VCH-${saleId}`, numAmount, notes]
-      );
-    }
+    // 3. Track in cashier_receipts so it reconciles with cashier records
+    const normalizedPaymentMethod = String(paymentMethod).toUpperCase() === "UPI" ? "UPI" : "CASH";
+    const receiptDesc = notes ? `Credit Payment VCH-${saleId} - ${notes}` : `Credit Payment VCH-${saleId}`;
+    await connection.query(
+      `
+      INSERT INTO cashier_receipts
+      (agency_id, cashier_id, receipt_type, amount, description, payment_mode, created_at)
+      VALUES (?, ?, 'DUE_COLLECTION', ?, ?, ?, NOW())
+      `,
+      [sale.agency_id, req.user?.id || 1, numAmount, receiptDesc, normalizedPaymentMethod]
+    );
 
     await connection.commit();
 

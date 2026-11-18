@@ -74,6 +74,11 @@ app.use((req, res, next) => {
 // Serve uploaded files as static assets
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.url}`);
+  next();
+});
+
 // Root and health endpoints (for networkMonitor latency pings & load balancers)
 app.get("/", (req, res) => {
   res.status(200).json({ status: "ok", service: "lpg-backend" });

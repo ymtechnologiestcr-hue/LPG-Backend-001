@@ -1,6 +1,9 @@
 import db from "../config/db.js";
 import { getDriverCarryForward } from "../utils/driverCarryForward.js";
 
+// In-memory idempotency cache for driver sales (client_tx_id -> { saleId, timestamp })
+const recentDriverSalesByTxId = new Map();
+
 const getBatchNo = (saleId) => `B-${saleId}`;
 const toNumber = (value) => Number(value || 0);
 const DEFAULT_STOCK_AREA_ID = 1;
@@ -129,6 +132,39 @@ const resolveDriverId = async (value, queryRunner = db) => {
     console.warn("Could not auto-create missing driver record:", err);
   }
 
+  return null;
+};
+
+const resolveDriverAgencyId = async (user, queryRunner = db) => {
+  if (user?.agency_id && Number(user.agency_id) > 0) {
+    return Number(user.agency_id);
+  }
+  const userId = user?.id || user?.user_id;
+  if (userId && Number(userId) > 0) {
+    const [uRows] = await queryRunner.execute(
+      "SELECT agency_id FROM users WHERE id = ? LIMIT 1",
+      [Number(userId)]
+    );
+    if (uRows.length && uRows[0].agency_id) {
+      return Number(uRows[0].agency_id);
+    }
+    const [dRows] = await queryRunner.execute(
+      "SELECT agency_id FROM drivers WHERE id = ? OR user_id = ? LIMIT 1",
+      [Number(userId), Number(userId)]
+    );
+    if (dRows.length && dRows[0].agency_id) {
+      return Number(dRows[0].agency_id);
+    }
+  }
+  if (user?.driver_id && Number(user.driver_id) > 0) {
+    const [dRows] = await queryRunner.execute(
+      "SELECT agency_id FROM drivers WHERE id = ? LIMIT 1",
+      [Number(user.driver_id)]
+    );
+    if (dRows.length && dRows[0].agency_id) {
+      return Number(dRows[0].agency_id);
+    }
+  }
   return null;
 };
 
@@ -508,6 +544,14 @@ export const findCustomerForDriverApp = async (req, res) => {
     }
 
     const searchValue = String(query).trim();
+    const agencyId = await resolveDriverAgencyId(req.user);
+
+    if (!agencyId) {
+      return res.status(403).json({
+        success: false,
+        message: "Driver agency could not be determined. Please log in again.",
+      });
+    }
 
     const [rows] = await db.execute(
       `
@@ -516,11 +560,13 @@ export const findCustomerForDriverApp = async (req, res) => {
         u.name,
         u.phone,
         u.email,
+        u.consumer_number,
         a.address
       FROM users u
       LEFT JOIN addresses a
         ON a.user_id = u.id
       WHERE u.role = 'CUSTOMER'
+        AND u.agency_id = ?
         AND (
           u.phone = ?
           OR u.consumer_number = ?
@@ -529,7 +575,7 @@ export const findCustomerForDriverApp = async (req, res) => {
       ORDER BY a.is_default DESC, a.id DESC
       LIMIT 1
       `,
-      [searchValue, searchValue, searchValue],
+      [agencyId, searchValue, searchValue, searchValue],
     );
 
     if (!rows.length) {
@@ -1132,6 +1178,8 @@ export const createDriverSale = async (req, res) => {
       batch_no = null,
       otp = null,
       customer_id = null,
+      client_tx_id = null,
+      idempotency_key = null,
     } = req.body;
 
     const numericDriverId = await resolveDriverId(driver_id, connection);
@@ -1187,45 +1235,40 @@ export const createDriverSale = async (req, res) => {
 
     const normalizedOtp = String(otp || "").trim();
 
-    // Idempotency / Duplicate Check
-    // If the exact same driver creates a sale for the exact same product and quantity
-    // with the exact same allocation or OTP within the last 1 minute,
-    // we consider it a duplicate retry from a frontend timeout and safely return success.
-    let duplicateCheckRows = [];
+    // Idempotency / Duplicate Check:
+    // 1. If client provided client_tx_id / idempotency_key, check recent completed sales cache
+    const effectiveClientTxId = client_tx_id || idempotency_key;
+    if (effectiveClientTxId && recentDriverSalesByTxId.has(String(effectiveClientTxId).trim())) {
+      const cached = recentDriverSalesByTxId.get(String(effectiveClientTxId).trim());
+      connection.release();
+      return res.status(200).json({
+        success: true,
+        message: "Sale created successfully (duplicate request handled)",
+        data: { saleId: cached.saleId }
+      });
+    }
 
-    if (allocation_sales_item_id) {
-      // Fast path: check by allocation_sales_item_id (no OTP table join needed)
+    // 2. Hardware double-tap protection:
+    // Only match if the exact same customer phone was submitted within the last 2 seconds.
+    // Different customers or sales submitted after 2 seconds are never blocked.
+    let duplicateCheckRows = [];
+    const trimmedPhone = phone ? String(phone).trim() : "";
+    if (trimmedPhone && allocation_sales_item_id) {
       [duplicateCheckRows] = await connection.execute(
         `
         SELECT s.id
         FROM sales s
         JOIN sales_items si ON s.id = si.sale_id
+        JOIN users u ON u.id = s.customer_id
         WHERE s.driver_id = ?
+          AND u.phone = ?
           AND si.product_id = ?
           AND si.quantity = ?
           AND si.allocation_sales_item_id = ?
-          AND s.created_at >= NOW() - INTERVAL 1 MINUTE
+          AND s.created_at >= NOW() - INTERVAL 2 SECOND
         LIMIT 1
         `,
-        [numericDriverId, numericProductId, numericQuantity, Number(allocation_sales_item_id)]
-      );
-    } else if (normalizedOtp) {
-      // Fallback: check by OTP when no allocation
-      [duplicateCheckRows] = await connection.execute(
-        `
-        SELECT s.id
-        FROM sales s
-        JOIN sales_items si ON s.id = si.sale_id
-        JOIN driver_sale_otps dso ON dso.sale_id = s.id
-        WHERE s.driver_id = ?
-          AND si.product_id = ?
-          AND si.quantity = ?
-          AND si.allocation_sales_item_id IS NULL
-          AND dso.otp = ?
-          AND s.created_at >= NOW() - INTERVAL 1 MINUTE
-        LIMIT 1
-        `,
-        [numericDriverId, numericProductId, numericQuantity, normalizedOtp]
+        [numericDriverId, trimmedPhone, numericProductId, numericQuantity, Number(allocation_sales_item_id)]
       );
     }
 
@@ -1355,14 +1398,14 @@ export const createDriverSale = async (req, res) => {
 
     let customerId = customer_id ? Number(customer_id) : null;
 
-    // Verify if the passed customerId actually exists in the users table
+    // Verify if the passed customerId actually exists in this agency
     if (customerId && customerId > 0) {
       const [existingUserRows] = await connection.execute(
-        `SELECT id FROM users WHERE id = ? LIMIT 1`,
-        [customerId],
+        `SELECT id FROM users WHERE id = ? AND agency_id = ? LIMIT 1`,
+        [customerId, agencyId],
       );
       if (!existingUserRows.length) {
-        console.warn(`createDriverSale: customer_id ${customerId} does not exist in users table; re-resolving by phone/name.`);
+        console.warn(`createDriverSale: customer_id ${customerId} does not exist in agency ${agencyId}; re-resolving by phone/name.`);
         customerId = null;
       }
     } else {
@@ -1371,8 +1414,8 @@ export const createDriverSale = async (req, res) => {
 
     if (!customerId && allocation_sale_id) {
       const [origSaleRows] = await connection.execute(
-        `SELECT s.customer_id FROM sales s INNER JOIN users u ON u.id = s.customer_id WHERE s.id = ? LIMIT 1`,
-        [Number(allocation_sale_id)],
+        `SELECT s.customer_id FROM sales s INNER JOIN users u ON u.id = s.customer_id WHERE s.id = ? AND s.agency_id = ? LIMIT 1`,
+        [Number(allocation_sale_id), agencyId],
       );
       if (origSaleRows.length && origSaleRows[0].customer_id) {
         customerId = origSaleRows[0].customer_id;
@@ -1386,10 +1429,10 @@ export const createDriverSale = async (req, res) => {
         `
         SELECT id
         FROM users
-        WHERE phone = ?
+        WHERE phone = ? AND agency_id = ? AND role = 'CUSTOMER'
         LIMIT 1
         `,
-        [phone],
+        [phone, agencyId],
       );
     }
 
@@ -1481,6 +1524,11 @@ export const createDriverSale = async (req, res) => {
     const finalAmount =
       unitPrice > 0 ? unitPrice * numericQuantity : requestedAmount;
 
+    const isCreditSale = String(payment_method).toUpperCase() === "CREDIT";
+    const initialReceived = isCreditSale ? 0 : finalAmount;
+    const initialPending = isCreditSale ? finalAmount : 0;
+    const initialCreditStatus = isCreditSale ? "PENDING" : "PAID";
+
     const [saleResult] = await connection.execute(
       `
       INSERT INTO sales
@@ -1494,11 +1542,24 @@ export const createDriverSale = async (req, res) => {
         status,
         created_at,
         updated_at,
-        delivered_at
+        delivered_at,
+        amount_received,
+        pending_amount,
+        credit_status
       )
-      VALUES (?, ?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW())
+      VALUES (?, ?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW(), ?, ?, ?)
       `,
-      [agencyId, customerId, numericDriverId, addressId, finalAmount, payment_method],
+      [
+        agencyId,
+        customerId,
+        numericDriverId,
+        addressId,
+        finalAmount,
+        payment_method,
+        initialReceived,
+        initialPending,
+        initialCreditStatus,
+      ],
     );
 
     const saleId = saleResult.insertId;
@@ -1626,6 +1687,21 @@ export const createDriverSale = async (req, res) => {
     }
 
     await connection.commit();
+
+    if (effectiveClientTxId) {
+      recentDriverSalesByTxId.set(String(effectiveClientTxId).trim(), {
+        saleId,
+        timestamp: Date.now(),
+      });
+      if (recentDriverSalesByTxId.size > 2000) {
+        const now = Date.now();
+        for (const [key, val] of recentDriverSalesByTxId.entries()) {
+          if (now - val.timestamp > 10 * 60 * 1000) {
+            recentDriverSalesByTxId.delete(key);
+          }
+        }
+      }
+    }
 
     return res.status(201).json({
       success: true,
@@ -1874,8 +1950,8 @@ export const createDriverReturn = async (req, res) => {
 
     if (phone && String(phone).trim() !== "") {
       [existingCustomers] = await connection.execute(
-        `SELECT id FROM users WHERE phone = ? AND role = 'CUSTOMER' LIMIT 1`,
-        [phone],
+        `SELECT id FROM users WHERE phone = ? AND agency_id = ? AND role = 'CUSTOMER' LIMIT 1`,
+        [phone, effectiveAgencyId],
       );
     }
 
@@ -1889,10 +1965,10 @@ export const createDriverReturn = async (req, res) => {
     } else {
       const [customerResult] = await connection.execute(
         `
-        INSERT INTO users (name, phone, role, created_at, updated_at)
-        VALUES (?, ?, 'CUSTOMER', NOW(), NOW())
+        INSERT INTO users (agency_id, name, phone, role, created_at, updated_at)
+        VALUES (?, ?, ?, 'CUSTOMER', NOW(), NOW())
         `,
-        [customer_name, phone || null],
+        [effectiveAgencyId, customer_name, phone || null],
       );
 
       customerId = customerResult.insertId;
@@ -2664,33 +2740,54 @@ export const getDriverCollectionHistory = async (req, res) => {
       });
     }
 
+    // Include dates from both settlement_history AND ONLINE sales (which have no settlement_history entry)
     const [dateRows] = await db.execute(
       `
-      SELECT DATE(sh.created_at) AS collection_date
-      FROM settlement_history sh
-      WHERE sh.driver_id = ?
-        AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
-        AND DATE(sh.created_at) BETWEEN ? AND ?
-      GROUP BY DATE(sh.created_at)
+      SELECT collection_date FROM (
+        SELECT DATE(sh.created_at) AS collection_date
+        FROM settlement_history sh
+        WHERE sh.driver_id = ?
+          AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
+          AND DATE(sh.created_at) BETWEEN ? AND ?
+        UNION
+        SELECT DATE(COALESCE(s.delivered_at, s.created_at)) AS collection_date
+        FROM sales s
+        WHERE s.driver_id = ?
+          AND s.status = 'DELIVERED'
+          AND s.payment_method = 'ONLINE'
+          AND DATE(COALESCE(s.delivered_at, s.created_at)) BETWEEN ? AND ?
+          AND NOT EXISTS (SELECT 1 FROM settlement_history sh2 WHERE sh2.sale_id = s.id)
+      ) combined
+      GROUP BY collection_date
       ORDER BY collection_date DESC
       LIMIT ${safeLimit} OFFSET ${offset}
       `,
-      [numericDriverId, startDate, endDate],
+      [numericDriverId, startDate, endDate, numericDriverId, startDate, endDate],
     );
 
     const [countRows] = await db.execute(
       `
       SELECT COUNT(*) AS totalDates
       FROM (
-        SELECT DATE(sh.created_at) AS collection_date
-        FROM settlement_history sh
-        WHERE sh.driver_id = ?
-          AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
-          AND DATE(sh.created_at) BETWEEN ? AND ?
-        GROUP BY DATE(sh.created_at)
+        SELECT collection_date FROM (
+          SELECT DATE(sh.created_at) AS collection_date
+          FROM settlement_history sh
+          WHERE sh.driver_id = ?
+            AND sh.status IN ('SETTLED', 'PENDING', 'ASSIGNED')
+            AND DATE(sh.created_at) BETWEEN ? AND ?
+          UNION
+          SELECT DATE(COALESCE(s.delivered_at, s.created_at)) AS collection_date
+          FROM sales s
+          WHERE s.driver_id = ?
+            AND s.status = 'DELIVERED'
+            AND s.payment_method = 'ONLINE'
+            AND DATE(COALESCE(s.delivered_at, s.created_at)) BETWEEN ? AND ?
+            AND NOT EXISTS (SELECT 1 FROM settlement_history sh2 WHERE sh2.sale_id = s.id)
+        ) combined
+        GROUP BY collection_date
       ) t
       `,
-      [numericDriverId, startDate, endDate],
+      [numericDriverId, startDate, endDate, numericDriverId, startDate, endDate],
     );
 
     const totalDates = Number(countRows[0]?.totalDates || 0);
@@ -2761,8 +2858,41 @@ export const getDriverCollectionHistory = async (req, res) => {
         [numericDriverId, collectionDate],
       );
 
+      // Fetch ONLINE sales on this date that have NO settlement_history entry
+      const [onlineSaleRows] = await db.execute(
+        `
+        SELECT
+          s.id AS sale_id,
+          s.total_amount AS amount,
+          s.payment_method AS payment_mode,
+          'ASSIGNED' AS settlement_history_status,
+          COALESCE(s.delivered_at, s.created_at) AS created_at,
+          u.name AS customer_name,
+          COALESCE(u.phone, '') AS customer_phone,
+          COALESCE(u.consumer_number, '') AS consumer_number,
+          COALESCE(SUM(CASE WHEN p.type = 'DOMESTIC' THEN si.quantity ELSE 0 END), 0) AS dom_qty,
+          COALESCE(SUM(CASE WHEN p.type = 'COMMERCIAL' THEN si.quantity ELSE 0 END), 0) AS com_qty,
+          COALESCE(SUM(CASE WHEN p.type != 'DOMESTIC' AND p.type != 'COMMERCIAL' THEN si.quantity ELSE 0 END), 0) AS items_qty
+        FROM sales s
+        LEFT JOIN users u ON u.id = s.customer_id
+        LEFT JOIN sales_items si ON si.sale_id = s.id
+        LEFT JOIN products p ON p.id = si.product_id
+        WHERE s.driver_id = ?
+          AND s.status = 'DELIVERED'
+          AND s.payment_method = 'ONLINE'
+          AND DATE(COALESCE(s.delivered_at, s.created_at)) = ?
+          AND NOT EXISTS (SELECT 1 FROM settlement_history sh3 WHERE sh3.sale_id = s.id)
+        GROUP BY s.id, s.total_amount, s.payment_method, s.delivered_at, s.created_at, u.name, u.phone, u.consumer_number
+        ORDER BY COALESCE(s.delivered_at, s.created_at) DESC, s.id DESC
+        `,
+        [numericDriverId, collectionDate],
+      );
+
+      // Merge settlement_history transactions with online-only sales
+      const allTransactionRows = [...transactionRows, ...onlineSaleRows];
+
       // Query sales_items for each sale to obtain item name, quantity, rate, total amount
-      const saleIds = Array.from(new Set(transactionRows.map((r) => r.sale_id).filter(Boolean)));
+      const saleIds = Array.from(new Set(allTransactionRows.map((r) => r.sale_id).filter(Boolean)));
       const saleItemsMap = {};
       if (saleIds.length > 0) {
         try {
@@ -2801,7 +2931,7 @@ export const getDriverCollectionHistory = async (req, res) => {
 
       // Aggregate consolidated item-wise breakdown for this collection
       const itemMap = new Map();
-      for (const row of transactionRows) {
+      for (const row of allTransactionRows) {
         const itemsList = saleItemsMap[row.sale_id] || [];
         if (itemsList.length > 0) {
           for (const it of itemsList) {
@@ -2839,7 +2969,7 @@ export const getDriverCollectionHistory = async (req, res) => {
       }
       const itemWiseBreakdown = Array.from(itemMap.values());
 
-      const mappedTransactions = transactionRows.map((row) => {
+      const mappedTransactions = allTransactionRows.map((row) => {
         const isOnline = ["UPI", "ONLINE", "CARD", "NET_BANKING"].includes(
           String(row.payment_mode || "").toUpperCase()
         );
@@ -2865,7 +2995,9 @@ export const getDriverCollectionHistory = async (req, res) => {
       const onlineTransactions = mappedTransactions.filter((t) => t.isOnline);
 
       const cashAmount = Number(summaryRows[0]?.cash_amount || 0);
-      const upiAmount = Number(summaryRows[0]?.upi_amount || 0);
+      // Include ONLINE sales amounts that have no settlement_history entry
+      const onlineSalesOnlyAmount = onlineSaleRows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+      const upiAmount = Number(summaryRows[0]?.upi_amount || 0) + onlineSalesOnlyAmount;
 
       const displayStatus =
         cashierStatus === "SETTLED" ? "APPROVED" : "PENDING_APPROVAL";
@@ -4677,6 +4809,17 @@ export const findBookingCustomer = async (req, res) => {
       });
     }
 
+    const agencyId = await resolveDriverAgencyId(req.user);
+
+    if (!agencyId) {
+      return res.status(403).json({
+        success: false,
+        message: "Driver agency could not be determined. Please log in again.",
+      });
+    }
+
+    const searchValue = String(phone).trim();
+
     const [rows] = await db.execute(
       `
       SELECT
@@ -4688,11 +4831,12 @@ export const findBookingCustomer = async (req, res) => {
       FROM users u
       LEFT JOIN addresses a ON a.user_id = u.id
       WHERE u.role = 'CUSTOMER'
+        AND u.agency_id = ?
         AND u.phone = ?
       ORDER BY a.is_default DESC, a.id DESC
       LIMIT 1
       `,
-      [String(phone).trim()],
+      [agencyId, searchValue],
     );
 
     if (!rows.length) {
@@ -4757,6 +4901,15 @@ export const createBookingCustomer = async (req, res) => {
       });
     }
 
+    const agencyId = await resolveDriverAgencyId(req.user, connection);
+    if (!agencyId) {
+      connection.release();
+      return res.status(403).json({
+        success: false,
+        message: "Driver agency could not be determined. Please log in again.",
+      });
+    }
+
     await connection.beginTransaction();
 
     const [existingRows] = await connection.execute(
@@ -4765,9 +4918,10 @@ export const createBookingCustomer = async (req, res) => {
       FROM users
       WHERE phone = ?
         AND role = 'CUSTOMER'
+        AND agency_id = ?
       LIMIT 1
       `,
-      [String(phone).trim()],
+      [String(phone).trim(), agencyId],
     );
 
     if (existingRows.length) {
@@ -4803,15 +4957,16 @@ export const createBookingCustomer = async (req, res) => {
       `
       INSERT INTO users
       (
+        agency_id,
         name,
         phone,
         role,
         status,
         created_at
       )
-      VALUES (?, ?, 'CUSTOMER', 'ACTIVE', NOW())
+      VALUES (?, ?, ?, 'CUSTOMER', 'ACTIVE', NOW())
       `,
-      [String(name).trim(), String(phone).trim()],
+      [agencyId || null, String(name).trim(), String(phone).trim()],
     );
 
     const customerId = userResult.insertId;
