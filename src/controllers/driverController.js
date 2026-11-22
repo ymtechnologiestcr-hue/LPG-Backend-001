@@ -1,9 +1,6 @@
 import db from "../config/db.js";
 import { getDriverCarryForward } from "../utils/driverCarryForward.js";
 
-// In-memory idempotency cache for driver sales (client_tx_id -> { saleId, timestamp })
-const recentDriverSalesByTxId = new Map();
-
 const getBatchNo = (saleId) => `B-${saleId}`;
 const toNumber = (value) => Number(value || 0);
 const DEFAULT_STOCK_AREA_ID = 1;
@@ -1022,6 +1019,16 @@ export const markSaleAsDelivered = async (req, res) => {
         updatableIds,
       );
 
+      await connection.execute(
+        `
+        UPDATE sales_items
+        SET status = 'DELIVERED',
+            delivered_qty = quantity
+        WHERE sale_id IN (${updatePlaceholders})
+        `,
+        updatableIds,
+      );
+
       return res.status(200).json({
         success: true,
         message: "Sales marked as delivered successfully",
@@ -1101,7 +1108,8 @@ export const markSaleAsDelivered = async (req, res) => {
     await connection.execute(
       `
       UPDATE sales_items
-      SET empty_cylinder_qty = ?,
+      SET status = 'DELIVERED',
+          empty_cylinder_qty = ?,
           empty_cylinder_status = CASE
             WHEN ? <= 0 THEN 'PENDING'
             WHEN ? >= quantity THEN 'DELIVERED'
@@ -1152,6 +1160,7 @@ const getEmptyCylinderStatus = (orderedQty, emptyQty) => {
 
 export const createDriverSale = async (req, res) => {
   const connection = await db.getConnection();
+  let normalizedClientTxId = null;
 
   try {
     const {
@@ -1235,22 +1244,30 @@ export const createDriverSale = async (req, res) => {
 
     const normalizedOtp = String(otp || "").trim();
 
-    // Idempotency / Duplicate Check:
-    // 1. If client provided client_tx_id / idempotency_key, check recent completed sales cache
+    // Idempotency / Duplicate Check. The database unique key is authoritative;
+    // this lookup returns the original result for retries after a timeout or
+    // process restart.
     const effectiveClientTxId = client_tx_id || idempotency_key;
-    if (effectiveClientTxId && recentDriverSalesByTxId.has(String(effectiveClientTxId).trim())) {
-      const cached = recentDriverSalesByTxId.get(String(effectiveClientTxId).trim());
-      connection.release();
-      return res.status(200).json({
-        success: true,
-        message: "Sale created successfully (duplicate request handled)",
-        data: { saleId: cached.saleId }
-      });
+    normalizedClientTxId = effectiveClientTxId
+      ? String(effectiveClientTxId).trim().slice(0, 80)
+      : null;
+    if (normalizedClientTxId) {
+      const [existingTxRows] = await connection.execute(
+        `SELECT id FROM sales WHERE agency_id = ? AND driver_id = ? AND client_tx_id = ? LIMIT 1`,
+        [agencyId, numericDriverId, normalizedClientTxId],
+      );
+      if (existingTxRows.length) {
+        const existingSaleId = Number(existingTxRows[0].id);
+        return res.status(200).json({
+          success: true,
+          message: "Sale created successfully (duplicate request handled)",
+          data: { saleId: existingSaleId },
+        });
+      }
     }
 
     // 2. Hardware double-tap protection:
     // Only match if the exact same customer phone was submitted within the last 2 seconds.
-    // Different customers or sales submitted after 2 seconds are never blocked.
     let duplicateCheckRows = [];
     const trimmedPhone = phone ? String(phone).trim() : "";
     if (trimmedPhone && allocation_sales_item_id) {
@@ -1536,6 +1553,7 @@ export const createDriverSale = async (req, res) => {
         agency_id,
         customer_id,
         driver_id,
+        client_tx_id,
         address_id,
         total_amount,
         payment_method,
@@ -1547,12 +1565,13 @@ export const createDriverSale = async (req, res) => {
         pending_amount,
         credit_status
       )
-      VALUES (?, ?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW(), ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'DELIVERED', NOW(), NOW(), NOW(), ?, ?, ?)
       `,
       [
         agencyId,
         customerId,
         numericDriverId,
+        normalizedClientTxId,
         addressId,
         finalAmount,
         payment_method,
@@ -1688,21 +1707,6 @@ export const createDriverSale = async (req, res) => {
 
     await connection.commit();
 
-    if (effectiveClientTxId) {
-      recentDriverSalesByTxId.set(String(effectiveClientTxId).trim(), {
-        saleId,
-        timestamp: Date.now(),
-      });
-      if (recentDriverSalesByTxId.size > 2000) {
-        const now = Date.now();
-        for (const [key, val] of recentDriverSalesByTxId.entries()) {
-          if (now - val.timestamp > 10 * 60 * 1000) {
-            recentDriverSalesByTxId.delete(key);
-          }
-        }
-      }
-    }
-
     return res.status(201).json({
       success: true,
       message: "Sale created successfully",
@@ -1740,6 +1744,23 @@ export const createDriverSale = async (req, res) => {
     });
   } catch (error) {
     await connection.rollback();
+
+    // Concurrent duplicate requests can both pass the lookup above. The
+    // unique index serializes that race; resolve the loser to the committed
+    // sale instead of reporting a failure that would trigger another replay.
+    if (error?.code === "ER_DUP_ENTRY" && normalizedClientTxId) {
+      const [existingRows] = await connection.execute(
+        `SELECT id FROM sales WHERE client_tx_id = ? LIMIT 1`,
+        [normalizedClientTxId],
+      );
+      if (existingRows.length) {
+        return res.status(200).json({
+          success: true,
+          message: "Sale created successfully (duplicate request handled)",
+          data: { saleId: Number(existingRows[0].id) },
+        });
+      }
+    }
 
     console.error("createDriverSale error:", error);
 

@@ -336,6 +336,25 @@ export const getGodownDashboardData = async (req, res) => {
         )
     `, [req.user.agency_id, startDate, endDate]);
 
+    const [pendingReturnRequestRows] = await db.execute(`
+      SELECT COUNT(DISTINCT st.id) AS pending_requests
+      FROM stock_transactions st
+      LEFT JOIN sales linked_sale
+        ON linked_sale.id = st.reference_id
+       AND linked_sale.driver_id = st.driver_id
+      JOIN drivers d ON d.id = st.driver_id
+      JOIN users u ON u.id = d.user_id
+      WHERE st.driver_id IS NOT NULL
+        AND COALESCE(st.isApproved, 0) = 0
+        AND (st.agency_id = ? OR d.agency_id = ? OR u.agency_id = ?)
+        AND DATE(st.created_at) BETWEEN ? AND ?
+        AND st.type IN ('EMPTY_RETURN', 'PURCHASE_RETURN')
+        AND (
+          st.type <> 'EMPTY_RETURN'
+          OR linked_sale.id IS NULL
+        )
+    `, [req.user.agency_id, req.user.agency_id, req.user.agency_id, startDate, endDate]);
+
     const [recentActivityRows] = await db.execute(
       `
       SELECT
@@ -387,6 +406,7 @@ export const getGodownDashboardData = async (req, res) => {
       },
       allocatedToday: 0,
       returnedToday: 0,
+      pendingReturnRequests: 0,
       totalDefectives: 0,
       cashierSaleStock,
       recentActivities: [],
@@ -437,6 +457,9 @@ export const getGodownDashboardData = async (req, res) => {
     );
     initial.allocatedToday = Number(allocatedTodayRows[0]?.allocated_today || 0);
     initial.returnedToday = Number(returnedTodayRows[0]?.returned_today || 0);
+    initial.pendingReturnRequests = Number(
+      pendingReturnRequestRows[0]?.pending_requests || 0,
+    );
 
     initial.recentActivities = recentActivityRows.map((row) => {
       const qty = Number(row.quantity || 0);
@@ -2511,9 +2534,13 @@ export const getDriverDayWiseSummary = async (req, res) => {
 
 export const createDriverAllocation = async (req, res) => {
   const connection = await db.getConnection();
+  let normalizedClientTxId = null;
 
   try {
-    const { driver_id, items = [] } = req.body;
+    const { driver_id, items = [], client_tx_id = null } = req.body;
+    normalizedClientTxId = client_tx_id
+      ? String(client_tx_id).trim().slice(0, 80)
+      : null;
 
     if (!driver_id) {
       return res.status(400).json({
@@ -2531,6 +2558,21 @@ export const createDriverAllocation = async (req, res) => {
         success: false,
         message: "At least one product quantity is required",
       });
+    }
+
+    if (normalizedClientTxId) {
+      const [existingRows] = await connection.execute(
+        `SELECT id FROM sales WHERE agency_id = ? AND driver_id = ? AND client_tx_id = ? LIMIT 1`,
+        [req.user.agency_id, Number(driver_id), normalizedClientTxId],
+      );
+      if (existingRows.length) {
+        const saleId = Number(existingRows[0].id);
+        return res.status(200).json({
+          success: true,
+          message: "Driver allocation created successfully (duplicate request handled)",
+          data: { sale_id: saleId, batch_no: `B-${saleId}` },
+        });
+      }
     }
 
     // Cylinders still in hand from a PREVIOUS day no longer block a new
@@ -2618,6 +2660,7 @@ export const createDriverAllocation = async (req, res) => {
       INSERT INTO sales
       (
         driver_id,
+        client_tx_id,
         total_amount,
         payment_method,
         status,
@@ -2628,9 +2671,9 @@ export const createDriverAllocation = async (req, res) => {
         assigned_at,
         agency_id
       )
-      VALUES (?, ?, 'ONLINE', 'ASSIGNED', 'SALE', 'DRIVER', NOW(), NOW(), NOW(), ?)
+      VALUES (?, ?, ?, 'ONLINE', 'ASSIGNED', 'SALE', 'DRIVER', NOW(), NOW(), NOW(), ?)
       `,
-      [driver_id, totalAmount, req.user.agency_id]
+      [driver_id, normalizedClientTxId, totalAmount, req.user.agency_id]
     );
 
     const saleId = saleResult.insertId;
@@ -2730,6 +2773,22 @@ export const createDriverAllocation = async (req, res) => {
     });
   } catch (error) {
     await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY" && normalizedClientTxId) {
+      const [existingRows] = await connection.execute(
+        `SELECT id FROM sales WHERE client_tx_id = ? LIMIT 1`,
+        [normalizedClientTxId],
+      );
+      if (existingRows.length) {
+        return res.status(200).json({
+          success: true,
+          message: "Driver allocation created successfully (duplicate request handled)",
+          data: {
+            sale_id: Number(existingRows[0].id),
+            batch_no: `B-${Number(existingRows[0].id)}`,
+          },
+        });
+      }
+    }
     console.error("createDriverAllocation error:", error);
 
     return res.status(500).json({
