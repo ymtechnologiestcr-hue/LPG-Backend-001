@@ -3013,6 +3013,14 @@ export const getDriverCollectionHistory = async (req, res) => {
       });
 
       const cashTransactions = mappedTransactions.filter((t) => !t.isOnline);
+      const upiTransactions = mappedTransactions.filter(
+        (t) => String(t.paymentMode || "").toUpperCase() === "UPI",
+      );
+      const iocOnlineTransactions = mappedTransactions.filter((t) =>
+        ["ONLINE", "CARD", "NET_BANKING"].includes(
+          String(t.paymentMode || "").toUpperCase(),
+        ),
+      );
       const onlineTransactions = mappedTransactions.filter((t) => t.isOnline);
 
       const cashAmount = Number(summaryRows[0]?.cash_amount || 0);
@@ -3043,6 +3051,8 @@ export const getDriverCollectionHistory = async (req, res) => {
         itemWiseBreakdown,
         transactions: mappedTransactions,
         cashTransactions,
+        upiTransactions,
+        iocOnlineTransactions,
         onlineTransactions,
       });
     }

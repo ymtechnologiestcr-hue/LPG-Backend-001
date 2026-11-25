@@ -1236,8 +1236,8 @@ export const getCashierDriverCollections = async (req, res) => {
         ), 0) AS totalCylinders,
         -- cash/upi collected: based on the original sale's payment method.
         -- This ensures that even if a driver settles CASH via UPI, the collected stats remain true to the source.
-        COALESCE(SUM(CASE WHEN s.payment_method = 'CASH' THEN sh.amount ELSE 0 END), 0) AS cashCollected,
-        COALESCE(SUM(CASE WHEN s.payment_method IN ('UPI', 'ONLINE') THEN sh.amount ELSE 0 END), 0) AS upiCollected,
+        COALESCE(SUM(CASE WHEN (s.payment_method = 'CASH' OR (s.payment_method IS NULL AND sh.method = 'CASH')) THEN sh.amount ELSE 0 END), 0) AS cashCollected,
+        COALESCE(SUM(CASE WHEN (s.payment_method IN ('UPI', 'ONLINE') OR (s.payment_method IS NULL AND sh.method IN ('UPI', 'ONLINE', 'CARD'))) THEN sh.amount ELSE 0 END), 0) AS upiCollected,
         -- total collected = ALL statuses (ASSIGNED + PENDING + SETTLED)
         COALESCE(SUM(sh.amount), 0) AS totalCollected,
         COALESCE(SUM(CASE WHEN sh.status = 'ASSIGNED' THEN sh.amount ELSE 0 END), 0) AS totalAssigned,
