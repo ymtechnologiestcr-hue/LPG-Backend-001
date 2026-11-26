@@ -28,6 +28,8 @@ import {
 import {
 	getOwnerSalesDetailedReport,
 	getOwnerDriverManagement,
+	addOwnerVehicle,
+	updateOwnerVehicle,
 	updateDriverVehicleDocuments,
 	getOwnerDriverCashSettlements,
 	getOwnerCreditSales,
@@ -74,6 +76,8 @@ router.get("/sales/report", getOwnerSalesDetailedReport);
 
 // 2. Driver Management Screen Redesign & Vehicle History
 router.get("/drivers/management", getOwnerDriverManagement);
+router.post("/vehicles", addOwnerVehicle);
+router.put("/vehicles/:vehicleId", updateOwnerVehicle);
 router.put("/drivers/:driverId/vehicle-documents", updateDriverVehicleDocuments);
 
 // 3. Cash Settlement & Separate Credit Sales

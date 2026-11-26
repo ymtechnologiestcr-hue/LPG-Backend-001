@@ -371,10 +371,10 @@ export const getOwnerDriverManagement = async (req, res) => {
         u.name AS driver_name,
         u.phone,
         d.vehicle_number,
-        d.pollution_expiry,
-        d.fitness_expiry,
-        d.explosives_expiry,
-        d.insurance_expiry
+        DATE_FORMAT(d.pollution_expiry, '%Y-%m-%d') AS pollution_expiry,
+        DATE_FORMAT(d.fitness_expiry, '%Y-%m-%d') AS fitness_expiry,
+        DATE_FORMAT(d.explosives_expiry, '%Y-%m-%d') AS explosives_expiry,
+        DATE_FORMAT(d.insurance_expiry, '%Y-%m-%d') AS insurance_expiry
       FROM drivers d
       INNER JOIN users u ON u.id = d.user_id
       WHERE u.agency_id = ?
@@ -464,10 +464,10 @@ export const getOwnerDriverManagement = async (req, res) => {
     }
 
     // Helper to evaluate vehicle document status
-    const evaluateDocStatus = (puc, fitness, exp) => {
+    const evaluateDocStatus = (puc, fitness, exp, ins) => {
       const today = new Date().toISOString().split("T")[0];
-      const dates = [puc, fitness, exp].filter(Boolean);
-      if (dates.length === 0) return "Valid";
+      const dates = [puc, fitness, exp, ins].filter(Boolean);
+      if (dates.length === 0) return "Pending";
 
       // Check if any expired
       for (const d of dates) {
@@ -486,12 +486,93 @@ export const getOwnerDriverManagement = async (req, res) => {
       return "Valid";
     };
 
+    const formatDateOnly = (val) => {
+      if (!val) return null;
+      if (typeof val === "string") return val.slice(0, 10);
+      if (val instanceof Date && !Number.isNaN(val.getTime())) {
+        return val.toISOString().slice(0, 10);
+      }
+      return String(val).slice(0, 10);
+    };
+
+    // Sync any newly added driver vehicles into the vehicles table
+    await connection.query(
+      `
+      INSERT IGNORE INTO vehicles (
+        agency_id,
+        driver_id,
+        vehicle_number,
+        pollution_expiry,
+        fitness_expiry,
+        explosives_expiry,
+        insurance_expiry
+      )
+      SELECT
+        COALESCE(d.agency_id, u.agency_id, ?) AS agency_id,
+        d.id AS driver_id,
+        UPPER(TRIM(d.vehicle_number)) AS vehicle_number,
+        d.pollution_expiry,
+        d.fitness_expiry,
+        d.explosives_expiry,
+        d.insurance_expiry
+      FROM drivers d
+      INNER JOIN users u ON u.id = d.user_id
+      WHERE u.agency_id = ?
+        AND d.vehicle_number IS NOT NULL
+        AND TRIM(d.vehicle_number) <> ''
+      `,
+      [agencyId, agencyId]
+    );
+
+    const [vehicleRows] = await connection.query(
+      `
+      SELECT
+        v.id AS vehicle_id,
+        v.driver_id,
+        u.name AS driver_name,
+        v.vehicle_number,
+        v.vehicle_type,
+        DATE_FORMAT(v.pollution_expiry, '%Y-%m-%d') AS pollution_expiry,
+        DATE_FORMAT(v.fitness_expiry, '%Y-%m-%d') AS fitness_expiry,
+        DATE_FORMAT(v.explosives_expiry, '%Y-%m-%d') AS explosives_expiry,
+        DATE_FORMAT(v.insurance_expiry, '%Y-%m-%d') AS insurance_expiry
+      FROM vehicles v
+      LEFT JOIN drivers d ON d.id = v.driver_id
+      LEFT JOIN users u ON u.id = d.user_id
+      WHERE v.agency_id = ? AND v.is_active = 1
+      ORDER BY v.id DESC
+      `,
+      [agencyId]
+    );
+
     let totalActiveDrivers = 0;
     let totalDeliveredToday = 0;
     let totalInHandToday = 0;
 
     const driversList = [];
     const vehicleHistoryList = [];
+    const driversWithVehicles = new Set();
+
+    for (const v of vehicleRows) {
+      if (v.driver_id) driversWithVehicles.add(Number(v.driver_id));
+      const pucStr = formatDateOnly(v.pollution_expiry);
+      const fitStr = formatDateOnly(v.fitness_expiry);
+      const expStr = formatDateOnly(v.explosives_expiry);
+      const insStr = formatDateOnly(v.insurance_expiry);
+
+      vehicleHistoryList.push({
+        vehicleId: Number(v.vehicle_id),
+        driverId: v.driver_id ? Number(v.driver_id) : null,
+        driverName: v.driver_name || "Unassigned",
+        vehicleNumber: v.vehicle_number,
+        vehicleType: v.vehicle_type || null,
+        pollutionExpiry: pucStr,
+        fitnessExpiry: fitStr,
+        explosivesExpiry: expStr,
+        insuranceExpiry: insStr,
+        documentStatus: evaluateDocStatus(pucStr, fitStr, expStr, insStr),
+      });
+    }
 
     for (const d of driverRows) {
       const driverId = d.driver_id;
@@ -560,21 +641,26 @@ export const getOwnerDriverManagement = async (req, res) => {
         totalSystemInHand: totalDriverSystemInHand,
       });
 
-      // Vehicle History entry
-      const pucStr = d.pollution_expiry ? String(d.pollution_expiry).slice(0, 10) : null;
-      const fitStr = d.fitness_expiry ? String(d.fitness_expiry).slice(0, 10) : null;
-      const expStr = d.explosives_expiry ? String(d.explosives_expiry).slice(0, 10) : null;
-      const docStatus = evaluateDocStatus(pucStr, fitStr, expStr);
+      // Fallback entry for registered drivers who have no vehicle registered yet
+      if (!driversWithVehicles.has(Number(driverId))) {
+        const pucStr = formatDateOnly(d.pollution_expiry);
+        const fitStr = formatDateOnly(d.fitness_expiry);
+        const expStr = formatDateOnly(d.explosives_expiry);
+        const insStr = formatDateOnly(d.insurance_expiry);
 
-      vehicleHistoryList.push({
-        driverId,
-        driverName: d.driver_name,
-        vehicleNumber: d.vehicle_number || "KL-08-AU-" + (1000 + driverId),
-        pollutionExpiry: pucStr || "2027-05-15",
-        fitnessExpiry: fitStr || "2027-08-20",
-        explosivesExpiry: expStr || "2027-11-10",
-        documentStatus: docStatus,
-      });
+        vehicleHistoryList.push({
+          vehicleId: null,
+          driverId,
+          driverName: d.driver_name,
+          vehicleNumber: d.vehicle_number || null,
+          vehicleType: null,
+          pollutionExpiry: pucStr,
+          fitnessExpiry: fitStr,
+          explosivesExpiry: expStr,
+          insuranceExpiry: insStr,
+          documentStatus: evaluateDocStatus(pucStr, fitStr, expStr, insStr),
+        });
+      }
     }
 
     return res.status(200).json({
@@ -599,13 +685,316 @@ export const getOwnerDriverManagement = async (req, res) => {
 };
 
 /**
- * Update Vehicle Documents and Expiry Dates
+ * Add a New Vehicle (optionally assigned to a delivery agent)
+ */
+export const addOwnerVehicle = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const agencyId = req.user?.agency_id || 1;
+    const {
+      driverId,
+      vehicleNumber,
+      vehicleType,
+      pollutionExpiry,
+      fitnessExpiry,
+      explosivesExpiry,
+      insuranceExpiry,
+    } = req.body || {};
+
+    const normalizedNumber = String(vehicleNumber || "").trim().toUpperCase();
+    if (!normalizedNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "Vehicle registration number is required",
+      });
+    }
+
+    const parsedDriverId =
+      driverId !== undefined && driverId !== null && String(driverId).trim() !== ""
+        ? Number(driverId)
+        : null;
+
+    if (parsedDriverId !== null) {
+      const [driverCheck] = await connection.query(
+        `
+        SELECT d.id
+        FROM drivers d
+        INNER JOIN users u ON u.id = d.user_id
+        WHERE d.id = ? AND u.agency_id = ?
+        LIMIT 1
+        `,
+        [parsedDriverId, agencyId]
+      );
+      if (!driverCheck.length) {
+        return res.status(404).json({
+          success: false,
+          message: "Selected delivery agent was not found in this agency",
+        });
+      }
+    }
+
+    const [existing] = await connection.query(
+      `SELECT id FROM vehicles WHERE agency_id = ? AND vehicle_number = ? AND is_active = 1 LIMIT 1`,
+      [agencyId, normalizedNumber]
+    );
+    if (existing.length) {
+      return res.status(409).json({
+        success: false,
+        message: `Vehicle ${normalizedNumber} already exists`,
+      });
+    }
+
+    const puc = pollutionExpiry || null;
+    const fit = fitnessExpiry || null;
+    const exp = explosivesExpiry || null;
+    const ins = insuranceExpiry || null;
+    const cleanType = vehicleType ? String(vehicleType).trim() : null;
+
+    await connection.beginTransaction();
+
+    const [insertRes] = await connection.query(
+      `
+      INSERT INTO vehicles (
+        agency_id,
+        driver_id,
+        vehicle_number,
+        vehicle_type,
+        pollution_expiry,
+        fitness_expiry,
+        explosives_expiry,
+        insurance_expiry
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [agencyId, parsedDriverId, normalizedNumber, cleanType, puc, fit, exp, ins]
+    );
+
+    if (parsedDriverId !== null) {
+      await connection.query(
+        `
+        UPDATE drivers
+        SET
+          vehicle_number = COALESCE(NULLIF(TRIM(vehicle_number), ''), ?),
+          pollution_expiry = COALESCE(?, pollution_expiry),
+          fitness_expiry = COALESCE(?, fitness_expiry),
+          explosives_expiry = COALESCE(?, explosives_expiry),
+          insurance_expiry = COALESCE(?, insurance_expiry)
+        WHERE id = ?
+        `,
+        [normalizedNumber, puc, fit, exp, ins, parsedDriverId]
+      );
+    }
+
+    await connection.commit();
+
+    return res.status(201).json({
+      success: true,
+      message: "Vehicle added successfully",
+      data: {
+        vehicleId: Number(insertRes.insertId),
+        driverId: parsedDriverId,
+        vehicleNumber: normalizedNumber,
+        vehicleType: cleanType,
+        pollutionExpiry: puc,
+        fitnessExpiry: fit,
+        explosivesExpiry: exp,
+        insuranceExpiry: ins,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+    if (error?.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({
+        success: false,
+        message: "A vehicle with this registration number already exists",
+      });
+    }
+    console.error("addOwnerVehicle error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to add vehicle",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+/**
+ * Update an Existing Vehicle Record & Documents
+ */
+export const updateOwnerVehicle = async (req, res) => {
+  const connection = await db.getConnection();
+  try {
+    const agencyId = req.user?.agency_id || 1;
+    const vehicleId = Number(req.params.vehicleId);
+    const {
+      driverId,
+      vehicleNumber,
+      vehicleType,
+      pollutionExpiry,
+      fitnessExpiry,
+      explosivesExpiry,
+      insuranceExpiry,
+    } = req.body || {};
+
+    if (!vehicleId) {
+      return res.status(400).json({ success: false, message: "Valid vehicleId is required" });
+    }
+
+    const [vehRows] = await connection.query(
+      `SELECT id, driver_id, vehicle_number FROM vehicles WHERE id = ? AND agency_id = ? LIMIT 1`,
+      [vehicleId, agencyId]
+    );
+    if (!vehRows.length) {
+      return res.status(404).json({ success: false, message: "Vehicle not found" });
+    }
+
+    const normalizedNumber = String(vehicleNumber || vehRows[0].vehicle_number || "").trim().toUpperCase();
+    if (!normalizedNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "Vehicle registration number is required",
+      });
+    }
+
+    const [dupRows] = await connection.query(
+      `SELECT id FROM vehicles WHERE agency_id = ? AND vehicle_number = ? AND id <> ? AND is_active = 1 LIMIT 1`,
+      [agencyId, normalizedNumber, vehicleId]
+    );
+    if (dupRows.length) {
+      return res.status(409).json({
+        success: false,
+        message: `Vehicle ${normalizedNumber} already exists`,
+      });
+    }
+
+    const hasDriverField = driverId !== undefined;
+    const parsedDriverId = hasDriverField
+      ? driverId !== null && String(driverId).trim() !== ""
+        ? Number(driverId)
+        : null
+      : vehRows[0].driver_id;
+
+    if (parsedDriverId !== null) {
+      const [driverCheck] = await connection.query(
+        `SELECT d.id FROM drivers d INNER JOIN users u ON u.id = d.user_id WHERE d.id = ? AND u.agency_id = ? LIMIT 1`,
+        [parsedDriverId, agencyId]
+      );
+      if (!driverCheck.length) {
+        return res.status(404).json({
+          success: false,
+          message: "Selected delivery agent was not found in this agency",
+        });
+      }
+    }
+
+    const cleanType = vehicleType !== undefined ? (vehicleType ? String(vehicleType).trim() : null) : undefined;
+    const puc = pollutionExpiry || null;
+    const fit = fitnessExpiry || null;
+    const exp = explosivesExpiry || null;
+    const ins = insuranceExpiry !== undefined ? (insuranceExpiry || null) : undefined;
+
+    await connection.beginTransaction();
+
+    await connection.query(
+      `
+      UPDATE vehicles
+      SET
+        driver_id = ?,
+        vehicle_number = ?,
+        vehicle_type = COALESCE(?, vehicle_type),
+        pollution_expiry = ?,
+        fitness_expiry = ?,
+        explosives_expiry = ?,
+        insurance_expiry = COALESCE(?, insurance_expiry)
+      WHERE id = ? AND agency_id = ?
+      `,
+      [
+        parsedDriverId,
+        normalizedNumber,
+        cleanType === undefined ? null : cleanType,
+        puc,
+        fit,
+        exp,
+        ins === undefined ? null : ins,
+        vehicleId,
+        agencyId,
+      ]
+    );
+
+    if (cleanType === null) {
+      await connection.query(`UPDATE vehicles SET vehicle_type = NULL WHERE id = ? AND agency_id = ?`, [vehicleId, agencyId]);
+    }
+
+    if (parsedDriverId !== null) {
+      await connection.query(
+        `
+        UPDATE drivers
+        SET
+          vehicle_number = CASE
+            WHEN vehicle_number IS NULL OR TRIM(vehicle_number) = '' OR UPPER(TRIM(vehicle_number)) = ? THEN ?
+            ELSE vehicle_number
+          END,
+          pollution_expiry = CASE
+            WHEN vehicle_number IS NULL OR TRIM(vehicle_number) = '' OR UPPER(TRIM(vehicle_number)) = ? THEN ?
+            ELSE pollution_expiry
+          END,
+          fitness_expiry = CASE
+            WHEN vehicle_number IS NULL OR TRIM(vehicle_number) = '' OR UPPER(TRIM(vehicle_number)) = ? THEN ?
+            ELSE fitness_expiry
+          END,
+          explosives_expiry = CASE
+            WHEN vehicle_number IS NULL OR TRIM(vehicle_number) = '' OR UPPER(TRIM(vehicle_number)) = ? THEN ?
+            ELSE explosives_expiry
+          END
+        WHERE id = ?
+        `,
+        [
+          String(vehRows[0].vehicle_number || "").trim().toUpperCase(),
+          normalizedNumber,
+          String(vehRows[0].vehicle_number || "").trim().toUpperCase(),
+          puc,
+          String(vehRows[0].vehicle_number || "").trim().toUpperCase(),
+          fit,
+          String(vehRows[0].vehicle_number || "").trim().toUpperCase(),
+          exp,
+          parsedDriverId,
+        ]
+      );
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: "Vehicle details updated successfully",
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error("updateOwnerVehicle error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update vehicle details",
+      error: error.message,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+/**
+ * Update Vehicle Documents and Expiry Dates (by driverId, synced with vehicles table)
  */
 export const updateDriverVehicleDocuments = async (req, res) => {
   const connection = await db.getConnection();
   try {
+    const agencyId = req.user?.agency_id || 1;
     const { driverId } = req.params;
-    const { vehicleNumber, pollutionExpiry, fitnessExpiry, explosivesExpiry } = req.body;
+    const { vehicleNumber, vehicleType, pollutionExpiry, fitnessExpiry, explosivesExpiry } = req.body;
+    const normalizedNumber = vehicleNumber ? String(vehicleNumber).trim().toUpperCase() : null;
+
+    await connection.beginTransaction();
 
     await connection.query(
       `
@@ -617,14 +1006,53 @@ export const updateDriverVehicleDocuments = async (req, res) => {
         explosives_expiry = ?
       WHERE id = ?
       `,
-      [vehicleNumber, pollutionExpiry || null, fitnessExpiry || null, explosivesExpiry || null, driverId]
+      [normalizedNumber, pollutionExpiry || null, fitnessExpiry || null, explosivesExpiry || null, driverId]
     );
+
+    if (normalizedNumber) {
+      const [existingVeh] = await connection.query(
+        `SELECT id FROM vehicles WHERE agency_id = ? AND driver_id = ? AND is_active = 1 LIMIT 1`,
+        [agencyId, driverId]
+      );
+      if (existingVeh.length) {
+        await connection.query(
+          `
+          UPDATE vehicles
+          SET
+            vehicle_number = ?,
+            vehicle_type = COALESCE(?, vehicle_type),
+            pollution_expiry = ?,
+            fitness_expiry = ?,
+            explosives_expiry = ?
+          WHERE id = ?
+          `,
+          [normalizedNumber, vehicleType || null, pollutionExpiry || null, fitnessExpiry || null, explosivesExpiry || null, existingVeh[0].id]
+        );
+      } else {
+        await connection.query(
+          `
+          INSERT INTO vehicles (agency_id, driver_id, vehicle_number, vehicle_type, pollution_expiry, fitness_expiry, explosives_expiry)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            driver_id = VALUES(driver_id),
+            vehicle_type = COALESCE(VALUES(vehicle_type), vehicle_type),
+            pollution_expiry = VALUES(pollution_expiry),
+            fitness_expiry = VALUES(fitness_expiry),
+            explosives_expiry = VALUES(explosives_expiry)
+          `,
+          [agencyId, driverId, normalizedNumber, vehicleType || null, pollutionExpiry || null, fitnessExpiry || null, explosivesExpiry || null]
+        );
+      }
+    }
+
+    await connection.commit();
 
     return res.status(200).json({
       success: true,
       message: "Vehicle document details updated successfully",
     });
   } catch (error) {
+    await connection.rollback();
     console.error("updateDriverVehicleDocuments error:", error);
     return res.status(500).json({ success: false, message: "Failed to update vehicle details", error: error.message });
   } finally {
