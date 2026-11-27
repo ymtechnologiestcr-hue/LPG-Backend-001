@@ -1,5 +1,6 @@
 import bcrypt from "bcryptjs";
 import db from "../config/db.js";
+import { resolveOrCreateAgencyStockAreaId } from "../utils/agencyStockScope.js";
 
 const DEFAULT_OWNER_PASSWORD =
   process.env.DEFAULT_OWNER_PASSWORD || "password@123";
@@ -28,7 +29,8 @@ export const registerAgency = async (req, res) => {
       .trim();
     const email_id = (req.body.email_id || req.body.emailId || "")
       .toString()
-      .trim();
+      .trim()
+      .toLowerCase();
     const address = (req.body.address || "").toString().trim();
     const state = (req.body.state || "").toString().trim();
     const district = (req.body.district || "").toString().trim();
@@ -90,7 +92,7 @@ export const registerAgency = async (req, res) => {
 
     // 2. Check if agency email or phone already exists in users table
     const [existingUsers] = await connection.execute(
-      "SELECT id FROM users WHERE email = ? OR phone = ?",
+      "SELECT id FROM users WHERE LOWER(email) = LOWER(?) OR phone = ?",
       [email_id, phone_number],
     );
 
@@ -126,18 +128,23 @@ export const registerAgency = async (req, res) => {
 
     const agencyId = agencyResult.insertId;
 
-    // 4. Create an OWNER user for this new agency
-    // The owner can log in using OTP via the phone number or email provided.
+    // Ensure every newly onboarded agency starts with its own valid default stock_area
+    await resolveOrCreateAgencyStockAreaId(connection, agencyId);
+
+    // 4. Create an OWNER user for this new agency with default password
+    // The owner can log in using email/phone + default password or OTP.
+    const hashedPassword = await bcrypt.hash(DEFAULT_OWNER_PASSWORD, 10);
     await connection.execute(
       `
-      INSERT INTO users (name, company_name, email, phone, role, status, agency_id)
-      VALUES (?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
+      INSERT INTO users (name, company_name, email, phone, password, role, status, agency_id)
+      VALUES (?, ?, ?, ?, ?, 'OWNER', 'ACTIVE', ?)
       `,
       [
         agency_name, // Defaulting owner name to agency name initially
         agency_name,
         email_id,
         phone_number,
+        hashedPassword,
         agencyId,
       ],
     );

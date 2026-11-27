@@ -1,4 +1,8 @@
 import db from "../config/db.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+} from "../utils/agencyStockScope.js";
 
 const cashierDayLog = {
   opening: null,
@@ -2918,10 +2922,11 @@ export const recordOfficeSale = async (req, res) => {
     const [productRows] = await connection.query(
       `
       SELECT id, name, type, price
-      FROM products
+      FROM products p
       WHERE id IN (${productPlaceholders})
+        AND ${getAgencyProductSqlFilter("p")}
       `,
-      uniqueProductIds,
+      [...uniqueProductIds, ...getAgencyProductFilterParams(req.user.agency_id)],
     );
 
     if (productRows.length !== uniqueProductIds.length) {

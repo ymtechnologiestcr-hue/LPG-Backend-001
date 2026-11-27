@@ -1,4 +1,8 @@
 import db from "../config/db.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+} from "../utils/agencyStockScope.js";
 
 const toPositiveAmount = (value) => {
   const amount = Number(value);
@@ -137,14 +141,16 @@ export const createCustomerConnection = async (req, res) => {
     let productRows = [];
 
     if (selectedProducts.length) {
+      const agencyId = req.user?.agency_id || null;
       const productIds = selectedProducts.map((item) => item.productId);
       const [rows] = await connection.query(
         `
         SELECT id, name, type, price
-        FROM products
+        FROM products p
         WHERE id IN (?)
+          ${agencyId ? `AND ${getAgencyProductSqlFilter("p")}` : ""}
         `,
-        [productIds]
+        agencyId ? [productIds, ...getAgencyProductFilterParams(agencyId)] : [productIds]
       );
 
       if (rows.length !== productIds.length) {
@@ -371,15 +377,23 @@ export const searchConnectionProducts = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = req.user?.agency_id || null;
     const search = (req.query.search || "").trim();
     const params = [];
-    let whereClause = "";
+    const conditions = [];
+
+    if (agencyId) {
+      conditions.push(getAgencyProductSqlFilter("p"));
+      params.push(...getAgencyProductFilterParams(agencyId));
+    }
 
     if (search) {
-      whereClause = "WHERE (p.name LIKE ? OR p.type LIKE ?)";
+      conditions.push("(p.name LIKE ? OR p.type LIKE ?)");
       const like = `%${search}%`;
       params.push(like, like);
     }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
     const [rows] = await connection.query(
       `

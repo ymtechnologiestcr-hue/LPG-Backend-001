@@ -1,5 +1,9 @@
 import db from "../config/db.js";
 import { findCustomerForLookup } from "../utils/customerLookup.js";
+import {
+  resolveOrCreateAgencyCategoryId,
+  resolveOrCreateAgencyStockAreaId,
+} from "../utils/agencyStockScope.js";
 
 export const lookupPenaltyCustomer = async (req, res) => {
   const connection = await db.getConnection();
@@ -65,65 +69,91 @@ export const lookupPenaltyCustomer = async (req, res) => {
 };
 
 export const ensurePrProductsAndStock = async (connection, agencyId = 1) => {
+  const safeAgencyId = Number(agencyId || 1);
   let [[cat]] = await connection.query(
-    "SELECT id FROM categories WHERE name LIKE '%Regulator%' OR name LIKE '%PR%' LIMIT 1"
+    "SELECT id FROM categories WHERE agency_id = ? AND (name LIKE '%Regulator%' OR name LIKE '%PR%') LIMIT 1",
+    [safeAgencyId]
   );
   let categoryId = cat?.id;
   if (!categoryId) {
-    const [catRes] = await connection.query("INSERT INTO categories (name) VALUES ('Pressure Regulator')");
-    categoryId = catRes.insertId;
+    categoryId = await resolveOrCreateAgencyCategoryId(
+      connection,
+      safeAgencyId,
+      "Pressure Regulator"
+    );
   }
 
   let [[normalPr]] = await connection.query(
-    "SELECT id, name FROM products WHERE name IN ('Normal PR', 'PR Stock', 'Pressure Regulator') LIMIT 1"
+    `
+    SELECT id, name
+    FROM products
+    WHERE name IN ('Normal PR', 'PR Stock', 'Pressure Regulator')
+      AND (
+        agency_id = ?
+        OR (
+          agency_id IS NULL
+          AND EXISTS (SELECT 1 FROM stock s WHERE s.product_id = products.id AND s.agency_id = ?)
+        )
+      )
+    ORDER BY (agency_id = ?) DESC
+    LIMIT 1
+    `,
+    [safeAgencyId, safeAgencyId, safeAgencyId]
   );
   if (!normalPr) {
     const [res] = await connection.query(
-      "INSERT INTO products (name, type, price, category_id) VALUES ('Normal PR', 'DOMESTIC', 250.00, ?)",
-      [categoryId]
+      "INSERT INTO products (agency_id, name, type, price, category_id) VALUES (?, 'Normal PR', 'DOMESTIC', 250.00, ?)",
+      [safeAgencyId, categoryId]
     );
-    normalPr = { id: res.insertId, name: 'Normal PR' };
+    normalPr = { id: res.insertId, name: "Normal PR" };
   }
 
   let [[defectivePr]] = await connection.query(
-    "SELECT id, name FROM products WHERE name IN ('Defective PR', 'Defective PR Stock') LIMIT 1"
+    `
+    SELECT id, name
+    FROM products
+    WHERE name IN ('Defective PR', 'Defective PR Stock')
+      AND (
+        agency_id = ?
+        OR (
+          agency_id IS NULL
+          AND EXISTS (SELECT 1 FROM stock s WHERE s.product_id = products.id AND s.agency_id = ?)
+        )
+      )
+    ORDER BY (agency_id = ?) DESC
+    LIMIT 1
+    `,
+    [safeAgencyId, safeAgencyId, safeAgencyId]
   );
   if (!defectivePr) {
     const [res] = await connection.query(
-      "INSERT INTO products (name, type, price, category_id) VALUES ('Defective PR', 'DOMESTIC', 0.00, ?)",
-      [categoryId]
+      "INSERT INTO products (agency_id, name, type, price, category_id) VALUES (?, 'Defective PR', 'DOMESTIC', 0.00, ?)",
+      [safeAgencyId, categoryId]
     );
-    defectivePr = { id: res.insertId, name: 'Defective PR' };
+    defectivePr = { id: res.insertId, name: "Defective PR" };
   }
 
-  let [[stockArea]] = await connection.query(
-    "SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1",
-    [agencyId]
-  );
-  if (!stockArea) {
-    [[stockArea]] = await connection.query("SELECT id FROM stock_areas LIMIT 1");
-  }
-  const stockAreaId = stockArea?.id;
+  const stockAreaId = await resolveOrCreateAgencyStockAreaId(connection, safeAgencyId);
 
   const [[normalStock]] = await connection.query(
     "SELECT id, quantity FROM stock WHERE product_id = ? AND agency_id = ? LIMIT 1",
-    [normalPr.id, agencyId]
+    [normalPr.id, safeAgencyId]
   );
   if (!normalStock) {
     await connection.query(
       "INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, empty_quantity, system_empty_quantity, agency_id) VALUES (?, ?, 50, 50, 0, 0, ?)",
-      [normalPr.id, stockAreaId, agencyId]
+      [normalPr.id, stockAreaId, safeAgencyId]
     );
   }
 
   const [[defectiveStock]] = await connection.query(
     "SELECT id, quantity FROM stock WHERE product_id = ? AND agency_id = ? LIMIT 1",
-    [defectivePr.id, agencyId]
+    [defectivePr.id, safeAgencyId]
   );
   if (!defectiveStock) {
     await connection.query(
       "INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, empty_quantity, system_empty_quantity, agency_id) VALUES (?, ?, 0, 0, 0, 0, ?)",
-      [defectivePr.id, stockAreaId, agencyId]
+      [defectivePr.id, stockAreaId, safeAgencyId]
     );
   }
 

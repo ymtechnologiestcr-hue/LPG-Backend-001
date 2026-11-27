@@ -1,4 +1,5 @@
 import db from "../config/db.js";
+import { resolveOrCreateAgencyStockAreaId } from "../utils/agencyStockScope.js";
 
 const DEFAULT_STOCK_AREA_ID = 1;
 
@@ -35,12 +36,16 @@ const deductSystemQuantity = async (connection, productId, qty, agencyId = 1) =>
       [amount, amount, rows[0].id]
     );
   } else {
+    const resolvedAreaId = await resolveOrCreateAgencyStockAreaId(
+      connection,
+      agencyId
+    );
     await connection.query(
       `
       INSERT INTO stock (product_id, stock_area_id, quantity, system_quantity, empty_quantity, system_empty_quantity, agency_id)
       VALUES (?, ?, 0, 0, 0, ?, ?)
       `,
-      [Number(productId), DEFAULT_STOCK_AREA_ID, amount, agencyId]
+      [Number(productId), resolvedAreaId, amount, agencyId]
     );
   }
 

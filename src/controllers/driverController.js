@@ -1,5 +1,10 @@
 import db from "../config/db.js";
 import { getDriverCarryForward } from "../utils/driverCarryForward.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+  resolveOrCreateAgencyStockAreaId,
+} from "../utils/agencyStockScope.js";
 
 const getBatchNo = (saleId) => `B-${saleId}`;
 const toNumber = (value) => Number(value || 0);
@@ -264,6 +269,11 @@ const restoreStockForBooking = async (connection, productId, quantity, agencyId 
     return;
   }
 
+  const stockAreaId = await resolveOrCreateAgencyStockAreaId(
+    connection,
+    effectiveAgencyId
+  );
+
   await connection.execute(
     `
     INSERT INTO stock
@@ -277,7 +287,7 @@ const restoreStockForBooking = async (connection, productId, quantity, agencyId 
     )
     VALUES (?, ?, ?, 0, 0, ?)
     `,
-    [Number(productId), DEFAULT_STOCK_AREA_ID, qty, effectiveAgencyId],
+    [Number(productId), stockAreaId, qty, effectiveAgencyId],
   );
 };
 
@@ -1303,11 +1313,12 @@ export const createDriverSale = async (req, res) => {
     const [productRows] = await connection.execute(
       `
       SELECT id, name, type, price
-      FROM products
+      FROM products p
       WHERE id = ?
+        AND ${getAgencyProductSqlFilter("p")}
       LIMIT 1
       `,
-      [numericProductId],
+      [numericProductId, ...getAgencyProductFilterParams(agencyId)],
     );
 
     if (!productRows.length) {
@@ -1942,8 +1953,8 @@ export const createDriverReturn = async (req, res) => {
     await ensureDriverReturnTables(connection);
 
     const [productRows] = await connection.execute(
-      `SELECT id, name, type, price FROM products WHERE id = ? LIMIT 1`,
-      [numericProductId],
+      `SELECT id, name, type, price FROM products p WHERE id = ? AND ${getAgencyProductSqlFilter("p")} LIMIT 1`,
+      [numericProductId, ...getAgencyProductFilterParams(effectiveAgencyId)],
     );
 
     if (!productRows.length) {
@@ -2658,20 +2669,32 @@ export const returnInHandToGodown = async (req, res) => {
     // =========================
     for (const row of pendingRows) {
       const productId = Number(row.product_id);
-      const stockAreaId = Number(row.stock_area_id);
+      const stockAreaId = row.stock_area_id ? Number(row.stock_area_id) : null;
       const qty = Number(row.quantity || 0);
 
-      const [stockRows] = await connection.execute(
-        `
-        SELECT id, quantity, quantity_return
-        FROM stock
-        WHERE product_id = ?
-          AND stock_area_id = ?
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [productId, stockAreaId],
-      );
+      const [stockRows] = stockAreaId
+        ? await connection.execute(
+            `
+            SELECT id, quantity, quantity_return
+            FROM stock
+            WHERE product_id = ?
+              AND stock_area_id = ?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [productId, stockAreaId],
+          )
+        : await connection.execute(
+            `
+            SELECT id, quantity, quantity_return
+            FROM stock
+            WHERE product_id = ?
+              AND stock_area_id IS NULL
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [productId],
+          );
 
       if (stockRows.length) {
         await connection.execute(
@@ -2679,23 +2702,27 @@ export const returnInHandToGodown = async (req, res) => {
           UPDATE stock
           SET quantity = quantity + ?,
               quantity_return = quantity_return + ?
-          WHERE product_id = ?
-            AND stock_area_id = ?
+          WHERE id = ?
           `,
-          [qty, qty, productId, stockAreaId],
+          [qty, qty, stockRows[0].id],
         );
       } else {
+        const effectiveAgencyId = Number(req.user?.agency_id || 1);
+        const targetAreaId =
+          stockAreaId ||
+          (await resolveOrCreateAgencyStockAreaId(connection, effectiveAgencyId));
         await connection.execute(
           `
           INSERT INTO stock (
             product_id,
             stock_area_id,
             quantity,
-            quantity_return
+            quantity_return,
+            agency_id
           )
-          VALUES (?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?)
           `,
-          [productId, stockAreaId, qty, qty],
+          [productId, targetAreaId, qty, qty, effectiveAgencyId],
         );
       }
     }
@@ -4027,11 +4054,16 @@ export const getDriverProfileHistory = async (req, res) => {
 
 export const searchProductsForDriverApp = async (req, res) => {
   try {
+    const agencyId = Number(req.user?.agency_id || 1);
     const { type, search = "" } = req.query;
 
     const searchText = String(search).trim();
 
-    const params = [`%${searchText}%`];
+    const params = [
+      agencyId,
+      ...getAgencyProductFilterParams(agencyId),
+      `%${searchText}%`,
+    ];
     let typeFilter = "";
 
     if (type && ["DOMESTIC", "COMMERCIAL"].includes(String(type))) {
@@ -4047,10 +4079,11 @@ export const searchProductsForDriverApp = async (req, res) => {
         p.type,
         p.price,
         c.name AS category_name,
-        COALESCE((SELECT SUM(s.quantity) FROM stock s WHERE s.product_id = p.id), 0) AS stock_quantity
+        COALESCE((SELECT SUM(s.quantity) FROM stock s WHERE s.product_id = p.id AND s.agency_id = ?), 0) AS stock_quantity
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.name LIKE ?
+      WHERE ${getAgencyProductSqlFilter("p")}
+        AND p.name LIKE ?
         ${typeFilter}
       ORDER BY p.name ASC
       LIMIT 20

@@ -4,6 +4,11 @@ import {
   ensureEmptyCylinderLoadTables,
 } from "./emptyCylinderLoadController.js";
 import { recordPurchaseInDailySnapshot } from "../utils/stockLedger.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+  resolveOrCreateAgencyStockAreaId,
+} from "../utils/agencyStockScope.js";
 
 const DEFAULT_PURCHASE_STOCK_AREA_ID = 2;
 const purchaseTripColumnCache = new Map();
@@ -147,11 +152,12 @@ const getDefaultStockArea = async (connection, agencyId) => {
 
   // Auto-create default stock area if none exists for this agency
   try {
-    const [result] = await connection.query(
-      `INSERT INTO stock_areas (agency_id, name, address) VALUES (?, 'Main Godown', 'Default Godown')`,
-      [agencyId]
+    const stockAreaId = await resolveOrCreateAgencyStockAreaId(connection, agencyId);
+    const [createdRows] = await connection.query(
+      `SELECT id, name FROM stock_areas WHERE id = ? LIMIT 1`,
+      [stockAreaId]
     );
-    return { id: result.insertId, name: 'Main Godown' };
+    return createdRows[0] || { id: stockAreaId, name: `Main Godown - ${agencyId}` };
   } catch (err) {
     return null;
   }
@@ -366,8 +372,10 @@ export const getPurchaseBootstrap = async (req, res) => {
           c.name AS category_name
         FROM products p
         LEFT JOIN categories c ON c.id = p.category_id
+        WHERE ${getAgencyProductSqlFilter("p")}
         ORDER BY p.type ASC, p.name ASC
         `,
+        getAgencyProductFilterParams(req.user.agency_id),
       ),
     ]);
 
@@ -1205,10 +1213,10 @@ export const createPurchaseLoad = async (req, res) => {
         `
         SELECT id
         FROM stock_areas
-        WHERE id = ?
+        WHERE id = ? AND agency_id = ?
         LIMIT 1
         `,
-        [effectiveStockAreaId],
+        [effectiveStockAreaId, req.user.agency_id],
       );
 
       if (!stockAreaRows.length) {
@@ -1224,10 +1232,11 @@ export const createPurchaseLoad = async (req, res) => {
     const [productRows] = await connection.query(
       `
       SELECT id, type
-      FROM products
+      FROM products p
       WHERE id IN (${placeholders})
+        AND ${getAgencyProductSqlFilter("p")}
       `,
-      productIds,
+      [...productIds, ...getAgencyProductFilterParams(req.user.agency_id)],
     );
 
     if (productRows.length !== normalizedItems.length) {
@@ -1431,10 +1440,11 @@ export const updatePurchaseLoad = async (req, res) => {
     const [productRows] = await connection.query(
       `
       SELECT id, type
-      FROM products
+      FROM products p
       WHERE id IN (${placeholders})
+        AND ${getAgencyProductSqlFilter("p")}
       `,
-      productIds,
+      [...productIds, ...getAgencyProductFilterParams(req.user.agency_id)],
     );
 
     if (productRows.length !== normalizedItems.length) {
@@ -1674,25 +1684,29 @@ const _approveLoadStock = async (connection, loadId) => {
 
   for (const tx of txRows) {
     const productId = Number(tx.product_id);
-    const stockAreaId = Number(tx.stock_area_id);
     const qty = Number(tx.quantity || 0);
     const agencyId = Number(tx.agency_id || 1);
+    const stockAreaId = await resolveOrCreateAgencyStockAreaId(
+      connection,
+      agencyId,
+      tx.stock_area_id
+    );
 
     const [stockRows] = await connection.query(
       `
       SELECT id
       FROM stock
-      WHERE product_id = ? AND stock_area_id = ?
+      WHERE product_id = ? AND stock_area_id = ? AND agency_id = ?
       LIMIT 1
       FOR UPDATE
       `,
-      [productId, stockAreaId],
+      [productId, stockAreaId, agencyId],
     );
 
     if (stockRows.length) {
       await connection.query(
-        `UPDATE stock SET quantity = quantity + ? WHERE product_id = ? AND stock_area_id = ?`,
-        [qty, productId, stockAreaId],
+        `UPDATE stock SET quantity = quantity + ? WHERE id = ?`,
+        [qty, stockRows[0].id],
       );
     } else {
       await connection.query(

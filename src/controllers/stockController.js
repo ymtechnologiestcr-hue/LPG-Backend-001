@@ -1,5 +1,15 @@
 import db from "../config/db.js";
 import { ensureDailyStockSnapshot } from "../utils/stockLedger.js";
+import {
+  ensureAgencyOwnedProductId,
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+  isProductSharedWithOtherAgencies,
+  resolveOrCreateAgencyCategoryId,
+  resolveOrCreateAgencyStockAreaId,
+  upsertAgencyStockRow,
+  verifyAgencyProductAccess,
+} from "../utils/agencyStockScope.js";
 
 export const getStockDashboard = async (req, res) => {
   const connection = await db.getConnection();
@@ -94,6 +104,10 @@ export const getStockDashboard = async (req, res) => {
       : "AND s.agency_id = ?";
     const salesAreaParams = stockAreaId ? [req.user.agency_id, req.user.agency_id, stockAreaId] : [req.user.agency_id];
 
+    const agencyId = Number(req.user.agency_id || 1);
+    const agencyProductFilter = getAgencyProductSqlFilter("p");
+    const agencyProductParams = getAgencyProductFilterParams(agencyId);
+
     const [summaryRows] = await connection.query(
       `
       SELECT
@@ -111,11 +125,17 @@ export const getStockDashboard = async (req, res) => {
           ${snapshotAreaFilter}
         GROUP BY dss.product_id
       ) stk ON stk.product_id = p.id
-      WHERE 1=1
+      WHERE ${agencyProductFilter}
       ${productSearchFilter}
       ${stockAreaProductFilter}
       `,
-      [startDate, ...snapshotAreaParams, ...productSearchParams, ...stockAreaProductParams]
+      [
+        startDate,
+        ...snapshotAreaParams,
+        ...agencyProductParams,
+        ...productSearchParams,
+        ...stockAreaProductParams,
+      ]
     );
 
     const [countRows] = await connection.query(
@@ -123,11 +143,11 @@ export const getStockDashboard = async (req, res) => {
       SELECT COUNT(*) AS total
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE 1=1
+      WHERE ${agencyProductFilter}
       ${productSearchFilter}
       ${stockAreaProductFilter}
       `,
-      [...productSearchParams, ...stockAreaProductParams]
+      [...agencyProductParams, ...productSearchParams, ...stockAreaProductParams]
     );
 
     const total = Number(countRows[0]?.total || 0);
@@ -290,7 +310,7 @@ export const getStockDashboard = async (req, res) => {
         GROUP BY st.product_id
       ) ret ON ret.product_id = p.id
 
-      WHERE 1=1
+      WHERE ${agencyProductFilter}
       ${productSearchFilter}
       ${stockAreaProductFilter}
       ORDER BY p.name ASC, p.type ASC
@@ -313,6 +333,7 @@ export const getStockDashboard = async (req, res) => {
         ...salesDateParams,
         req.user.agency_id,
         ...txDateParams,
+        ...agencyProductParams,
         ...productSearchParams,
         ...stockAreaProductParams,
         limit,
@@ -684,12 +705,13 @@ export const searchOwnerStockCategories = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const search = String(req.query.search || "").trim();
-    const params = [];
+    const params = [agencyId, ...getAgencyProductFilterParams(agencyId)];
     let filter = "";
 
     if (search) {
-      filter = "WHERE c.name LIKE ?";
+      filter = "AND c.name LIKE ?";
       params.push(`%${search}%`);
     }
 
@@ -697,6 +719,18 @@ export const searchOwnerStockCategories = async (req, res) => {
       `
       SELECT c.id, c.name
       FROM categories c
+      WHERE (
+        c.agency_id = ?
+        OR (
+          c.agency_id IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM products p
+            WHERE p.category_id = c.id
+              AND ${getAgencyProductSqlFilter("p")}
+          )
+        )
+      )
       ${filter}
       ORDER BY c.name ASC
       LIMIT 30
@@ -724,6 +758,7 @@ export const searchOwnerStockItems = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const categoryId = Number(req.query.categoryId || 0);
     const search = String(req.query.search || "").trim();
 
@@ -734,7 +769,7 @@ export const searchOwnerStockItems = async (req, res) => {
       });
     }
 
-    const params = [categoryId];
+    const params = [categoryId, ...getAgencyProductFilterParams(agencyId)];
     let searchFilter = "";
 
     if (search) {
@@ -752,6 +787,7 @@ export const searchOwnerStockItems = async (req, res) => {
         p.category_id AS categoryId
       FROM products p
       WHERE p.category_id = ?
+        AND ${getAgencyProductSqlFilter("p")}
       ${searchFilter}
       ORDER BY p.name ASC
       LIMIT 40
@@ -779,6 +815,7 @@ export const getOwnerStockItemContext = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const itemId = Number(req.query.itemId || 0);
 
     if (!itemId) {
@@ -788,15 +825,7 @@ export const getOwnerStockItemContext = async (req, res) => {
       });
     }
 
-    const [[product]] = await connection.query(
-      `
-      SELECT p.id, p.name, p.price
-      FROM products p
-      WHERE p.id = ?
-      LIMIT 1
-      `,
-      [itemId]
-    );
+    const product = await verifyAgencyProductAccess(connection, agencyId, itemId);
 
     if (!product) {
       return res.status(404).json({
@@ -806,24 +835,22 @@ export const getOwnerStockItemContext = async (req, res) => {
     }
 
     const [[existingArea]] = await connection.query(
-      `SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1`,
-      [req.user.agency_id]
+      `SELECT id FROM stock_areas WHERE agency_id = ? ORDER BY id ASC LIMIT 1`,
+      [agencyId]
     );
 
-    let stockAreaId = existingArea ? existingArea.id : null;
+    const preferredAreaId = existingArea ? Number(existingArea.id) : 0;
 
-    let stockRow = null;
-    if (stockAreaId) {
-      [[stockRow]] = await connection.query(
-        `
-        SELECT quantity, system_quantity, empty_quantity, system_empty_quantity
-        FROM stock
-        WHERE product_id = ? AND stock_area_id = ? AND agency_id = ?
-        LIMIT 1
-        `,
-        [itemId, stockAreaId, req.user.agency_id]
-      );
-    }
+    const [[stockRow]] = await connection.query(
+      `
+      SELECT quantity, system_quantity, empty_quantity, system_empty_quantity
+      FROM stock
+      WHERE product_id = ? AND agency_id = ?
+      ORDER BY (stock_area_id = ?) DESC, id ASC
+      LIMIT 1
+      `,
+      [itemId, agencyId, preferredAreaId]
+    );
 
     return res.status(200).json({
       success: true,
@@ -852,6 +879,7 @@ export const createOwnerStockCategoryWithItem = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const categoryName = String(req.body.categoryName || "").trim();
     const itemName = String(req.body.itemName || "").trim();
 
@@ -864,30 +892,24 @@ export const createOwnerStockCategoryWithItem = async (req, res) => {
 
     await connection.beginTransaction();
 
-    let categoryId;
-    const [[existingCategory]] = await connection.query(
-      `SELECT id, name FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1`,
-      [categoryName]
+    const categoryId = await resolveOrCreateAgencyCategoryId(
+      connection,
+      agencyId,
+      categoryName
     );
-
-    if (existingCategory) {
-      categoryId = existingCategory.id;
-    } else {
-      const [catInsert] = await connection.query(
-        `INSERT INTO categories (name) VALUES (?)`,
-        [categoryName]
-      );
-      categoryId = catInsert.insertId;
-    }
+    const [[savedCategory]] = await connection.query(
+      `SELECT id, name FROM categories WHERE id = ? LIMIT 1`,
+      [categoryId]
+    );
 
     const [[existingItem]] = await connection.query(
       `
       SELECT id, name, type, price, category_id AS categoryId
       FROM products
-      WHERE category_id = ? AND LOWER(name) = LOWER(?)
+      WHERE agency_id = ? AND category_id = ? AND LOWER(name) = LOWER(?)
       LIMIT 1
       `,
-      [categoryId, itemName]
+      [agencyId, categoryId, itemName]
     );
 
     let item;
@@ -896,8 +918,8 @@ export const createOwnerStockCategoryWithItem = async (req, res) => {
     } else {
       const type = inferProductType(categoryName, itemName);
       const [itemInsert] = await connection.query(
-        `INSERT INTO products (name, type, category_id, price) VALUES (?, ?, ?, NULL)`,
-        [itemName, type, categoryId]
+        `INSERT INTO products (agency_id, name, type, category_id, price) VALUES (?, ?, ?, ?, NULL)`,
+        [agencyId, itemName, type, categoryId]
       );
       item = {
         id: itemInsert.insertId,
@@ -916,7 +938,7 @@ export const createOwnerStockCategoryWithItem = async (req, res) => {
       data: {
         category: {
           id: categoryId,
-          name: existingCategory?.name || categoryName,
+          name: savedCategory?.name || categoryName,
         },
         item,
       },
@@ -938,6 +960,7 @@ export const createOwnerStockItem = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const categoryId = Number(req.body.categoryId || 0);
     const itemName = String(req.body.itemName || "").trim();
 
@@ -949,8 +972,24 @@ export const createOwnerStockItem = async (req, res) => {
     }
 
     const [[category]] = await connection.query(
-      `SELECT id, name FROM categories WHERE id = ? LIMIT 1`,
-      [categoryId]
+      `
+      SELECT id, name, agency_id
+      FROM categories
+      WHERE id = ?
+        AND (
+          agency_id = ?
+          OR (
+            agency_id IS NULL
+            AND EXISTS (
+              SELECT 1 FROM products p
+              WHERE p.category_id = categories.id
+                AND ${getAgencyProductSqlFilter("p")}
+            )
+          )
+        )
+      LIMIT 1
+      `,
+      [categoryId, agencyId, ...getAgencyProductFilterParams(agencyId)]
     );
 
     if (!category) {
@@ -960,14 +999,19 @@ export const createOwnerStockItem = async (req, res) => {
       });
     }
 
+    const targetCategoryId =
+      Number(category.agency_id) === agencyId
+        ? Number(category.id)
+        : await resolveOrCreateAgencyCategoryId(connection, agencyId, category.name);
+
     const [[existingItem]] = await connection.query(
       `
       SELECT id, name, type, price, category_id AS categoryId
       FROM products
-      WHERE category_id = ? AND LOWER(name) = LOWER(?)
+      WHERE agency_id = ? AND category_id = ? AND LOWER(name) = LOWER(?)
       LIMIT 1
       `,
-      [categoryId, itemName]
+      [agencyId, targetCategoryId, itemName]
     );
 
     if (existingItem) {
@@ -980,8 +1024,8 @@ export const createOwnerStockItem = async (req, res) => {
 
     const type = inferProductType(category.name, itemName);
     const [insertResult] = await connection.query(
-      `INSERT INTO products (name, type, category_id, price) VALUES (?, ?, ?, NULL)`,
-      [itemName, type, categoryId]
+      `INSERT INTO products (agency_id, name, type, category_id, price) VALUES (?, ?, ?, ?, NULL)`,
+      [agencyId, itemName, type, targetCategoryId]
     );
 
     return res.status(201).json({
@@ -992,7 +1036,7 @@ export const createOwnerStockItem = async (req, res) => {
         name: itemName,
         type,
         price: null,
-        categoryId,
+        categoryId: targetCategoryId,
       },
     });
   } catch (error) {
@@ -1079,42 +1123,40 @@ export const upsertOwnerStockEntry = async (req, res) => {
       });
     }
 
+    const agencyId = Number(req.user.agency_id || 1);
+
     await connection.beginTransaction();
 
-    const [[existingProduct]] = await connection.query(
-      `SELECT id FROM products WHERE id = ? LIMIT 1`,
-      [itemId]
+    const ownedProduct = await ensureAgencyOwnedProductId(
+      connection,
+      agencyId,
+      itemId
     );
-    if (!existingProduct) {
+    if (!ownedProduct) {
       await connection.rollback();
       return res.status(404).json({
         success: false,
         message: "Item not found",
       });
     }
+    const targetItemId = Number(ownedProduct.id);
 
-    const [[existingArea]] = await connection.query(
-      `SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1`,
-      [req.user.agency_id]
+    const stockAreaId = await resolveOrCreateAgencyStockAreaId(
+      connection,
+      agencyId,
+      req.body.stockAreaId
     );
-    let stockAreaId;
-
-    if (!existingArea) {
-      const areaName = 'Main Godown - ' + req.user.agency_id;
-      const [insertResult] = await connection.query(
-        `INSERT INTO stock_areas (agency_id, name, address) VALUES (?, ?, 'Default Address')`,
-        [req.user.agency_id, areaName]
-      );
-      stockAreaId = insertResult.insertId;
-    } else {
-      stockAreaId = existingArea.id;
-    }
 
     const [[existingStock]] = await connection.query(
-      `SELECT quantity, system_quantity, empty_quantity, system_empty_quantity 
-       FROM stock 
-       WHERE product_id = ? AND stock_area_id = ? AND agency_id = ? FOR UPDATE`,
-      [itemId, stockAreaId, req.user.agency_id]
+      `
+      SELECT quantity, system_quantity, empty_quantity, system_empty_quantity
+      FROM stock
+      WHERE product_id = ? AND agency_id = ?
+      ORDER BY (stock_area_id = ?) DESC, id ASC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [targetItemId, agencyId, stockAreaId]
     );
 
     const physicalDelta = Math.floor(quantity) - Number(existingStock?.quantity || 0);
@@ -1133,33 +1175,17 @@ export const upsertOwnerStockEntry = async (req, res) => {
       ? Math.floor(systemEmptyQuantity) 
       : Number(existingStock?.system_empty_quantity || 0);
 
-    await connection.query(`UPDATE products SET price = ? WHERE id = ?`, [price, itemId]);
+    await connection.query(`UPDATE products SET price = ? WHERE id = ?`, [price, targetItemId]);
 
-    await connection.query(
-      `
-      INSERT INTO stock (
-        product_id, stock_area_id, quantity, system_quantity, 
-        quantity_return, empty_quantity, system_empty_quantity, 
-        defective_quantity, agency_id
-      )
-      VALUES (?, ?, ?, ?, 0, ?, ?, 0, ?)
-      ON DUPLICATE KEY UPDATE
-        quantity = VALUES(quantity),
-        system_quantity = VALUES(system_quantity),
-        empty_quantity = VALUES(empty_quantity),
-        system_empty_quantity = VALUES(system_empty_quantity),
-        updated_at = CURRENT_TIMESTAMP
-      `,
-      [
-        itemId,
-        stockAreaId,
-        Math.floor(quantity),
-        Math.floor(systemQuantity),
-        targetEmptyQuantity,
-        targetSystemEmptyQuantity,
-        req.user.agency_id,
-      ]
-    );
+    await upsertAgencyStockRow(connection, {
+      agencyId,
+      productId: targetItemId,
+      stockAreaId,
+      quantity: Math.floor(quantity),
+      systemQuantity: Math.floor(systemQuantity),
+      emptyQuantity: targetEmptyQuantity,
+      systemEmptyQuantity: targetSystemEmptyQuantity,
+    });
 
     for (const [delta, metric] of [
       [physicalDelta, "physical"],
@@ -1186,19 +1212,19 @@ export const upsertOwnerStockEntry = async (req, res) => {
           agency_id
         ) VALUES (?, ?, 'NEW_VALUE', ?, 1, NULL, ?, 'default', 0, ?, ?)
         `,
-        [itemId, stockAreaId, delta, req.user.id || null, transactionNote, req.user.agency_id]
+        [targetItemId, stockAreaId, delta, req.user.id || null, transactionNote, agencyId]
       );
     }
 
     // Ensure today's snapshot baseline exists
-    await ensureDailyStockSnapshot(connection, req.user.agency_id, null, stockAreaId);
+    await ensureDailyStockSnapshot(connection, agencyId, null, stockAreaId);
 
     const [todaySnapshots] = await connection.query(
       `SELECT id, opening_stock, system_opening, empty_opening, system_empty_opening, 
               purchase_qty, sales_qty, system_sales_qty, empty_closing, system_empty_closing
        FROM daily_stock_snapshots 
        WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE() FOR UPDATE`,
-      [req.user.agency_id, stockAreaId, itemId]
+      [agencyId, stockAreaId, targetItemId]
     );
 
     if (todaySnapshots.length > 0) {
@@ -1269,6 +1295,7 @@ export const getOwnerStockPriceCatalog = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const [rows] = await connection.query(
       `
       SELECT
@@ -1280,8 +1307,10 @@ export const getOwnerStockPriceCatalog = async (req, res) => {
         c.name AS categoryName
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
+      WHERE ${getAgencyProductSqlFilter("p")}
       ORDER BY c.name ASC, p.name ASC
-      `
+      `,
+      getAgencyProductFilterParams(agencyId)
     );
 
     return res.status(200).json({
@@ -1344,12 +1373,13 @@ export const updateOwnerStockPrices = async (req, res) => {
       });
     }
 
+    const agencyId = Number(req.user.agency_id || 1);
     const uniqueProductIds = [...new Set(normalizedUpdates.map((item) => item.productId))];
     const placeholders = uniqueProductIds.map(() => "?").join(", ");
 
     const [existingProducts] = await connection.query(
-      `SELECT id, price FROM products WHERE id IN (${placeholders})`,
-      uniqueProductIds
+      `SELECT p.id, p.price FROM products p WHERE p.id IN (${placeholders}) AND ${getAgencyProductSqlFilter("p")}`,
+      [...uniqueProductIds, ...getAgencyProductFilterParams(agencyId)]
     );
 
     const currentById = new Map(
@@ -1357,6 +1387,7 @@ export const updateOwnerStockPrices = async (req, res) => {
     );
 
     const changedUpdates = normalizedUpdates.filter((item) => {
+      if (!currentById.has(item.productId)) return false;
       const current = currentById.get(item.productId);
       if (current == null) return true;
       return Number(current) !== Number(item.newPrice);
@@ -1392,10 +1423,16 @@ export const updateOwnerStockPrices = async (req, res) => {
 
     for (const item of changedUpdates) {
       const currentPrice = currentById.get(item.productId);
+      const ownedProduct = await ensureAgencyOwnedProductId(
+        connection,
+        agencyId,
+        item.productId
+      );
+      const targetProductId = ownedProduct ? Number(ownedProduct.id) : item.productId;
 
       await connection.query(`UPDATE products SET price = ? WHERE id = ?`, [
         item.newPrice,
-        item.productId,
+        targetProductId,
       ]);
 
       await connection.query(
@@ -1410,12 +1447,12 @@ export const updateOwnerStockPrices = async (req, res) => {
         ) VALUES (?, ?, ?, ?, ?, ?)
         `,
         [
-          item.productId,
+          targetProductId,
           currentPrice,
           item.newPrice,
           effectiveDate || null,
           reason || null,
-          null,
+          req.user.id || null,
         ]
       );
     }
@@ -1444,6 +1481,7 @@ export const updateOwnerStockProduct = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const productId = Number(req.params.productId || req.params.id || 0);
     const {
       name,
@@ -1458,6 +1496,7 @@ export const updateOwnerStockProduct = async (req, res) => {
       emptyStock,
       systemEmptyStock,
       systemEmptyQuantity,
+      stockAreaId: requestedStockAreaId,
     } = req.body;
 
     if (!productId) {
@@ -1467,12 +1506,13 @@ export const updateOwnerStockProduct = async (req, res) => {
       });
     }
 
-    const [[existingProduct]] = await connection.query(
-      `SELECT p.*, c.name AS current_category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ? LIMIT 1`,
-      [productId]
+    const existingAccess = await verifyAgencyProductAccess(
+      connection,
+      agencyId,
+      productId
     );
 
-    if (!existingProduct) {
+    if (!existingAccess) {
       return res.status(404).json({
         success: false,
         message: "Product not found",
@@ -1507,33 +1547,32 @@ export const updateOwnerStockProduct = async (req, res) => {
 
     await connection.beginTransaction();
 
-    let categoryId = existingProduct.category_id;
+    const ownedProduct = await ensureAgencyOwnedProductId(
+      connection,
+      agencyId,
+      productId,
+      categoryName
+    );
+    const targetProductId = Number(ownedProduct.id);
+
+    let categoryId = ownedProduct.category_id;
     if (categoryName && String(categoryName).trim()) {
-      const cleanCatName = String(categoryName).trim();
-      const [[foundCat]] = await connection.query(
-        `SELECT id FROM categories WHERE LOWER(name) = LOWER(?) LIMIT 1`,
-        [cleanCatName]
+      categoryId = await resolveOrCreateAgencyCategoryId(
+        connection,
+        agencyId,
+        String(categoryName).trim()
       );
-      if (foundCat) {
-        categoryId = foundCat.id;
-      } else {
-        const [catResult] = await connection.query(
-          `INSERT INTO categories (name) VALUES (?)`,
-          [cleanCatName]
-        );
-        categoryId = catResult.insertId;
-      }
     }
 
-    const updatedName = name !== undefined && String(name).trim() ? String(name).trim() : existingProduct.name;
+    const updatedName = name !== undefined && String(name).trim() ? String(name).trim() : ownedProduct.name;
     const updatedType = type && ["DOMESTIC", "COMMERCIAL"].includes(String(type).toUpperCase())
       ? String(type).toUpperCase()
-      : existingProduct.type;
-    const updatedPrice = price !== undefined && price !== null && price !== "" ? Number(price) : existingProduct.price;
+      : ownedProduct.type;
+    const updatedPrice = price !== undefined && price !== null && price !== "" ? Number(price) : ownedProduct.price;
 
     await connection.query(
       `UPDATE products SET name = ?, type = ?, price = ?, category_id = ? WHERE id = ?`,
-      [updatedName, updatedType, updatedPrice, categoryId, productId]
+      [updatedName, updatedType, updatedPrice, categoryId, targetProductId]
     );
 
     const hasStockUpdate =
@@ -1548,11 +1587,11 @@ export const updateOwnerStockProduct = async (req, res) => {
     let targetSystemEmptyQuantity = null;
 
     if (hasStockUpdate) {
-      const [[stockArea]] = await connection.query(
-        `SELECT id FROM stock_areas WHERE agency_id = ? LIMIT 1`,
-        [req.user.agency_id]
+      const stockAreaId = await resolveOrCreateAgencyStockAreaId(
+        connection,
+        agencyId,
+        requestedStockAreaId
       );
-      const stockAreaId = stockArea?.id || 1;
 
       const newOpening = openingStock !== undefined && openingStock !== null && openingStock !== ""
         ? Number(openingStock)
@@ -1561,12 +1600,16 @@ export const updateOwnerStockProduct = async (req, res) => {
         ? Number(systemStock)
         : null;
 
-      // Ensure today's snapshot exists
-      await ensureDailyStockSnapshot(connection, req.user.agency_id, null, stockAreaId);
-
       const [[existingStock]] = await connection.query(
-        `SELECT quantity, system_quantity, empty_quantity, system_empty_quantity FROM stock WHERE product_id = ? AND stock_area_id = ? AND agency_id = ? LIMIT 1`,
-        [productId, stockAreaId, req.user.agency_id]
+        `
+        SELECT quantity, system_quantity, empty_quantity, system_empty_quantity
+        FROM stock
+        WHERE product_id = ? AND agency_id = ?
+        ORDER BY (stock_area_id = ?) DESC, id ASC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [targetProductId, agencyId, stockAreaId]
       );
 
       targetQuantity = newOpening !== null ? Math.floor(newOpening) : Number(existingStock?.quantity || 0);
@@ -1574,36 +1617,23 @@ export const updateOwnerStockProduct = async (req, res) => {
       targetEmptyQuantity = newEmptyPhysical !== null ? Math.floor(newEmptyPhysical) : Number(existingStock?.empty_quantity || 0);
       targetSystemEmptyQuantity = newSystemEmpty !== null ? Math.floor(newSystemEmpty) : Number(existingStock?.system_empty_quantity || 0);
 
-      await connection.query(
-        `
-        INSERT INTO stock (
-          product_id, stock_area_id, quantity, system_quantity, 
-          quantity_return, empty_quantity, system_empty_quantity, 
-          defective_quantity, agency_id
-        )
-        VALUES (?, ?, ?, ?, 0, ?, ?, 0, ?)
-        ON DUPLICATE KEY UPDATE 
-          quantity = VALUES(quantity), 
-          system_quantity = VALUES(system_quantity), 
-          empty_quantity = VALUES(empty_quantity), 
-          system_empty_quantity = VALUES(system_empty_quantity), 
-          updated_at = CURRENT_TIMESTAMP
-        `,
-        [
-          productId,
-          stockAreaId,
-          targetQuantity,
-          targetSystemQuantity,
-          targetEmptyQuantity,
-          targetSystemEmptyQuantity,
-          req.user.agency_id,
-        ]
-      );
+      await upsertAgencyStockRow(connection, {
+        agencyId,
+        productId: targetProductId,
+        stockAreaId,
+        quantity: targetQuantity,
+        systemQuantity: targetSystemQuantity,
+        emptyQuantity: targetEmptyQuantity,
+        systemEmptyQuantity: targetSystemEmptyQuantity,
+      });
+
+      // Ensure today's snapshot exists for this agency & area
+      await ensureDailyStockSnapshot(connection, agencyId, null, stockAreaId);
 
       // Update today's daily_stock_snapshots for snapshot_date = CURDATE()
       const [todaySnapshots] = await connection.query(
         `SELECT id, opening_stock, system_opening, empty_opening, system_empty_opening, empty_closing, system_empty_closing, purchase_qty, sales_qty, system_sales_qty FROM daily_stock_snapshots WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE() FOR UPDATE`,
-        [req.user.agency_id, stockAreaId, productId]
+        [agencyId, stockAreaId, targetProductId]
       );
 
       if (todaySnapshots.length) {
@@ -1656,7 +1686,7 @@ export const updateOwnerStockProduct = async (req, res) => {
       success: true,
       message: "Category and product updated successfully",
       data: {
-        id: productId,
+        id: targetProductId,
         name: updatedName,
         type: updatedType,
         price: updatedPrice,
@@ -1686,6 +1716,7 @@ export const deleteOwnerStockProduct = async (req, res) => {
   const connection = await db.getConnection();
 
   try {
+    const agencyId = Number(req.user.agency_id || 1);
     const productId = Number(req.params.productId || req.params.id || 0);
 
     if (!productId) {
@@ -1695,9 +1726,10 @@ export const deleteOwnerStockProduct = async (req, res) => {
       });
     }
 
-    const [[existingProduct]] = await connection.query(
-      `SELECT id, name, category_id FROM products WHERE id = ? LIMIT 1`,
-      [productId]
+    const existingProduct = await verifyAgencyProductAccess(
+      connection,
+      agencyId,
+      productId
     );
 
     if (!existingProduct) {
@@ -1707,10 +1739,15 @@ export const deleteOwnerStockProduct = async (req, res) => {
       });
     }
 
-    // Check if sales exist for this product
+    // Check if sales exist for this product in this agency
     const [[salesCount]] = await connection.query(
-      `SELECT COUNT(*) AS count FROM sales_items WHERE product_id = ?`,
-      [productId]
+      `
+      SELECT COUNT(*) AS count
+      FROM sales_items si
+      INNER JOIN sales s ON s.id = si.sale_id
+      WHERE si.product_id = ? AND s.agency_id = ?
+      `,
+      [productId, agencyId]
     );
 
     if (salesCount && salesCount.count > 0) {
@@ -1720,10 +1757,15 @@ export const deleteOwnerStockProduct = async (req, res) => {
       });
     }
 
-    // Check if purchase records exist for this product
+    // Check if purchase records exist for this product in this agency
     const [[purchaseCount]] = await connection.query(
-      `SELECT COUNT(*) AS count FROM purchase_load_items WHERE product_id = ?`,
-      [productId]
+      `
+      SELECT COUNT(*) AS count
+      FROM purchase_load_items pli
+      INNER JOIN purchase_loads pl ON pl.id = pli.load_id
+      WHERE pli.product_id = ? AND pl.agency_id = ?
+      `,
+      [productId, agencyId]
     );
 
     if (purchaseCount && purchaseCount.count > 0) {
@@ -1733,10 +1775,15 @@ export const deleteOwnerStockProduct = async (req, res) => {
       });
     }
 
-    // Check if customer new connection records exist for this product
+    // Check if customer new connection records exist for this product in this agency
     const [[connCount]] = await connection.query(
-      `SELECT COUNT(*) AS count FROM customer_new_connection_products WHERE product_id = ?`,
-      [productId]
+      `
+      SELECT COUNT(*) AS count
+      FROM customer_new_connection_products ncp
+      INNER JOIN customer_new_connections cnc ON cnc.id = ncp.connection_id
+      WHERE ncp.product_id = ? AND cnc.agency_id = ?
+      `,
+      [productId, agencyId]
     );
 
     if (connCount && connCount.count > 0) {
@@ -1746,38 +1793,48 @@ export const deleteOwnerStockProduct = async (req, res) => {
       });
     }
 
+    const sharedWithOthers =
+      existingProduct.agency_id == null
+        ? await isProductSharedWithOtherAgencies(connection, agencyId, productId)
+        : false;
+
     await connection.beginTransaction();
 
     await connection.query(
-      `DELETE FROM stock_price_history WHERE product_id = ?`,
-      [productId]
-    );
-
-    await connection.query(
       `DELETE FROM daily_stock_snapshots WHERE product_id = ? AND agency_id = ?`,
-      [productId, req.user.agency_id]
+      [productId, agencyId]
     );
 
     await connection.query(
       `DELETE FROM stock WHERE product_id = ? AND agency_id = ?`,
-      [productId, req.user.agency_id]
+      [productId, agencyId]
     );
 
     await connection.query(
       `DELETE FROM stock_transactions WHERE product_id = ? AND agency_id = ?`,
-      [productId, req.user.agency_id]
+      [productId, agencyId]
     );
 
-    await connection.query(`DELETE FROM products WHERE id = ?`, [productId]);
-
-    // Clean up category if empty
-    if (existingProduct.category_id) {
-      const [[catCount]] = await connection.query(
-        `SELECT COUNT(*) AS count FROM products WHERE category_id = ?`,
-        [existingProduct.category_id]
+    if (Number(existingProduct.agency_id) === agencyId || !sharedWithOthers) {
+      await connection.query(
+        `DELETE FROM stock_price_history WHERE product_id = ?`,
+        [productId]
       );
-      if (catCount && catCount.count === 0) {
-        await connection.query(`DELETE FROM categories WHERE id = ?`, [existingProduct.category_id]);
+
+      await connection.query(`DELETE FROM products WHERE id = ?`, [productId]);
+
+      // Clean up category only if it belongs to this agency and is now empty
+      if (existingProduct.category_id) {
+        const [[catCount]] = await connection.query(
+          `SELECT COUNT(*) AS count FROM products WHERE category_id = ?`,
+          [existingProduct.category_id]
+        );
+        if (catCount && catCount.count === 0) {
+          await connection.query(
+            `DELETE FROM categories WHERE id = ? AND (agency_id = ? OR agency_id IS NULL)`,
+            [existingProduct.category_id, agencyId]
+          );
+        }
       }
     }
 

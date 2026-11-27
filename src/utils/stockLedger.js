@@ -1,4 +1,9 @@
 import db from "../config/db.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+  resolveOrCreateAgencyStockAreaId,
+} from "./agencyStockScope.js";
 
 let dailyStockTableEnsured = false;
 
@@ -115,7 +120,7 @@ const resolveStockAreaIds = async (conn, agencyId, stockAreaId) => {
     return stockRows.map((s) => Number(s.stock_area_id));
   }
 
-  return [1];
+  return [];
 };
 
 /**
@@ -161,9 +166,23 @@ export const ensureDailyStockSnapshot = async (
     const safeAgencyId = Number(agencyId || 1);
     const areaIds = await resolveStockAreaIds(conn, safeAgencyId, stockAreaId);
 
+    if (!areaIds.length) {
+      return [];
+    }
+
     const [products] = await conn.query(
-      `SELECT id FROM products ORDER BY id ASC`
+      `
+      SELECT p.id
+      FROM products p
+      WHERE ${getAgencyProductSqlFilter("p")}
+      ORDER BY p.id ASC
+      `,
+      getAgencyProductFilterParams(safeAgencyId)
     );
+
+    if (!products.length) {
+      return [];
+    }
 
     for (const areaId of areaIds) {
       // Find which products already have snapshots for this date & area
@@ -342,7 +361,13 @@ export const recordPurchaseInDailySnapshot = async (
   const shouldRelease = !connection;
 
   try {
-    await ensureDailyStockSnapshot(conn, agencyId, null, stockAreaId);
+    const safeAgencyId = Number(agencyId || 1);
+    const effectiveAreaId = await resolveOrCreateAgencyStockAreaId(
+      conn,
+      safeAgencyId,
+      stockAreaId
+    );
+    await ensureDailyStockSnapshot(conn, safeAgencyId, null, effectiveAreaId);
 
     await conn.query(
       `
@@ -353,7 +378,7 @@ export const recordPurchaseInDailySnapshot = async (
           updated_at = NOW()
       WHERE agency_id = ? AND stock_area_id = ? AND product_id = ? AND snapshot_date = CURDATE()
       `,
-      [qty, qty, qty, Number(agencyId || 1), Number(stockAreaId || 1), Number(productId)]
+      [qty, qty, qty, safeAgencyId, effectiveAreaId, Number(productId)]
     );
   } finally {
     if (shouldRelease) {

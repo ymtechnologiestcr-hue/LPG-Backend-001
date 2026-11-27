@@ -5,6 +5,10 @@ import {
   getDriverCarryForward,
 } from "../utils/driverCarryForward.js";
 import { recordPurchaseInDailySnapshot } from "../utils/stockLedger.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+} from "../utils/agencyStockScope.js";
 
 const DEFAULT_STOCK_AREA_ID = 1;
 const DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -286,8 +290,9 @@ export const getGodownDashboardData = async (req, res) => {
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
       LEFT JOIN categories c ON c.id = p.category_id
+      WHERE ${getAgencyProductSqlFilter("p")}
       GROUP BY p.id, p.name, p.type, c.name
-    `, [req.user.agency_id]);
+    `, [req.user.agency_id, ...getAgencyProductFilterParams(req.user.agency_id)]);
 
     const [allocatedTodayRows] = await db.execute(`
       SELECT
@@ -563,10 +568,11 @@ export const getStockDetailByType = async (req, res) => {
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
       WHERE p.type = ?
+        AND ${getAgencyProductSqlFilter("p")}
       GROUP BY p.id, p.name, p.type
       ORDER BY p.name ASC
       `,
-      [req.user.agency_id, normalizedType]
+      [req.user.agency_id, normalizedType, ...getAgencyProductFilterParams(req.user.agency_id)]
     );
 
     // For empty view:
@@ -1410,12 +1416,13 @@ export const getCylinderProducts = async (req, res) => {
         FROM products p
         LEFT JOIN categories c ON c.id = p.category_id
         LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
+        WHERE ${getAgencyProductSqlFilter("p")}
         GROUP BY p.id, p.name, p.type, c.name
         HAVING COALESCE(SUM(s.empty_quantity), 0) > 0
            OR COALESCE(SUM(s.defective_quantity), 0) > 0
         ORDER BY p.type ASC, p.name ASC
         `,
-        [req.user.agency_id]
+        [req.user.agency_id, ...getAgencyProductFilterParams(req.user.agency_id)]
       );
 
       return res.json({
@@ -1459,9 +1466,10 @@ export const getCylinderProducts = async (req, res) => {
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
+      WHERE ${getAgencyProductSqlFilter("p")}
       GROUP BY p.id, p.name, p.type, c.name
       ORDER BY p.type ASC, p.name ASC
-    `, [req.user.agency_id]);
+    `, [req.user.agency_id, ...getAgencyProductFilterParams(req.user.agency_id)]);
 
     return res.json({
       success: true,
@@ -2604,10 +2612,11 @@ export const createDriverAllocation = async (req, res) => {
     const [productRows] = await connection.execute(
       `
       SELECT id, name, price
-      FROM products
+      FROM products p
       WHERE id IN (${placeholders})
+        AND ${getAgencyProductSqlFilter("p")}
       `,
-      productIds
+      [...productIds, ...getAgencyProductFilterParams(req.user.agency_id)]
     );
 
     const productMap = new Map(

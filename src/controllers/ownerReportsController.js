@@ -1,4 +1,8 @@
 import db from "../config/db.js";
+import {
+  getAgencyProductFilterParams,
+  getAgencyProductSqlFilter,
+} from "../utils/agencyStockScope.js";
 
 const getISTTodayStr = () => {
   const formatter = new Intl.DateTimeFormat("en-CA", {
@@ -1417,7 +1421,7 @@ export const getOwnerStockInventoryReport = async (req, res) => {
     const agencyId = req.user?.agency_id || 1;
     const { start, end, startDate, endDate, label } = parseReportDateRange(req);
 
-    // Fetch all products
+    // Fetch agency-scoped products
     const [products] = await connection.query(
       `
       SELECT
@@ -1432,9 +1436,10 @@ export const getOwnerStockInventoryReport = async (req, res) => {
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id AND s.agency_id = ?
       WHERE p.type IN ('DOMESTIC', 'COMMERCIAL')
+        AND ${getAgencyProductSqlFilter("p")}
       ORDER BY p.type DESC, p.name ASC
       `,
-      [agencyId]
+      [agencyId, ...getAgencyProductFilterParams(agencyId)]
     );
 
     // Purchases in period
